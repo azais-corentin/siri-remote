@@ -34,6 +34,7 @@ pub struct RemoteDevice {
     pub paired: bool,
     pub bonded: bool,
     pub trusted: bool,
+    pub connected: bool,
     pub uuids: Vec<String>,
     pub modalias: String,
     pub manufacturer_data: HashMap<u16, Vec<u8>>,
@@ -119,6 +120,7 @@ fn build_remote(path: &str, props: &HashMap<String, OwnedValue>) -> Option<Remot
     let paired = props.get("Paired").and_then(try_bool).unwrap_or(false);
     let bonded = props.get("Bonded").and_then(try_bool).unwrap_or(false);
     let trusted = props.get("Trusted").and_then(try_bool).unwrap_or(false);
+    let connected = props.get("Connected").and_then(try_bool).unwrap_or(false);
     let modalias = props.get("Modalias").and_then(try_str).unwrap_or_default();
     let uuids = props
         .get("UUIDs")
@@ -141,6 +143,7 @@ fn build_remote(path: &str, props: &HashMap<String, OwnedValue>) -> Option<Remot
         paired,
         bonded,
         trusted,
+        connected,
         uuids,
         modalias,
         manufacturer_data,

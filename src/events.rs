@@ -136,8 +136,19 @@ async fn choose_initial_selection(
         return Ok(selection);
     }
 
-    match scan::scan_for_nearest_remote(adapter, scan_dur).await {
-        Some(cand) => {
+    // 1) BlueZ already knows about a bonded Siri Remote — by far the common
+    //    case once `pair` has run once. Pick the one currently connected if
+    //    any, otherwise the first bonded entry. This makes a bare
+    //    `siri-remote events` invocation Just Work.
+    #[cfg(target_os = "linux")]
+    if let Some(selection) = pick_bonded_selection().await {
+        return Ok(selection);
+    }
+
+    // 2) No bonded Siri Remote — fall back to a pair-mode scan and pair the
+    //    closest remote that's broadcasting the Apple HID prefix.
+    match scan::scan_for_remote(adapter, scan_dur, scan_dur + Duration::from_secs(30)).await {
+        Ok(cand) => {
             let selection = Selection {
                 address: cand.last_address.clone(),
                 name: cand
@@ -146,14 +157,62 @@ async fn choose_initial_selection(
                     .unwrap_or_else(|| cand.identity_address.clone()),
                 peripheral_id: Some(cand.peripheral_id),
                 identity_address: Some(cand.identity_address),
-                requires_pairing: false,
+                requires_pairing: true,
                 rssi: Some(cand.last_rssi),
             };
-            print_selected(&selection, "strongest currently advertising Siri Remote");
+            print_selected(
+                &selection,
+                "Siri Remote in pairing mode; bonding before connecting",
+            );
             Ok(selection)
         }
-        None => Err(InitError::Timeout),
+        Err(scan::ScanError::Timeout) => Err(InitError::Timeout),
+        Err(scan::ScanError::Other(e)) => Err(InitError::Invalid(e.to_string())),
     }
+}
+
+#[cfg(target_os = "linux")]
+async fn pick_bonded_selection() -> Option<Selection> {
+    let conn = bluez::device::connect().await.ok()?;
+    let remotes = bluez::device::list_siri_remotes(&conn, None).await.ok()?;
+    if remotes.is_empty() {
+        return None;
+    }
+    // Prefer the one BlueZ already has a live connection on, then the rest.
+    let chosen = remotes
+        .iter()
+        .find(|r| r.connected)
+        .unwrap_or(&remotes[0]);
+    if remotes.len() > 1 {
+        eprintln!(
+            "{} bonded Siri Remote(s) found; picking {} ({}). Pass --address to override.",
+            remotes.len(),
+            chosen.display_name(),
+            chosen.address,
+        );
+        for r in &remotes {
+            let marker = if r.address == chosen.address { "*" } else { " " };
+            eprintln!(
+                "  {marker} address={} name={:?} connected={} bonded={}",
+                r.address, r.name, r.connected, r.bonded,
+            );
+        }
+    }
+    let selection = Selection {
+        address: chosen.address.clone(),
+        name: chosen.display_name(),
+        peripheral_id: None,
+        identity_address: Some(chosen.address.clone()),
+        requires_pairing: false,
+        rssi: None,
+    };
+    let reason = if chosen.connected {
+        "bonded and currently connected"
+    } else {
+        "bonded (will reconnect)"
+    };
+    print_selected(&selection, reason);
+    Some(selection)
 }
 
 fn normalize_address(addr: &str) -> Result<String, String> {
