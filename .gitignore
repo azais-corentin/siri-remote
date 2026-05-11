@@ -1,3 +1,8 @@
 /.nrf-sniffer/
 __pycache__/
 *.pyc
+
+
+# Added by cargo
+
+/target

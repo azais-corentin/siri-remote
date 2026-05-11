@@ -13,7 +13,7 @@
         let pkgs = import nixpkgs { inherit system; };
         in {
           default = pkgs.mkShell {
-            packages = [ pkgs.python3 pkgs.uv ];
+            packages = [ pkgs.python3 pkgs.uv pkgs.rustc pkgs.cargo pkgs.clippy pkgs.rustfmt pkgs.pkg-config pkgs.dbus ];
           };
         });
     };

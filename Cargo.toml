@@ -1,0 +1,28 @@
+[package]
+name = "siri-remote"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "siri-remote"
+path = "src/main.rs"
+
+[dependencies]
+btleplug = "0.11"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time", "io-util", "sync"] }
+futures = "0.3"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+uuid = "1"
+chrono = "0.4"
+hex = "0.4"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = { version = "5", default-features = false, features = ["tokio"] }
+zvariant = "5"
+
+[profile.dev]
+opt-level = 0
+
+[profile.release]
+lto = "thin"
