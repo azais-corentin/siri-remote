@@ -18,23 +18,30 @@ pub const APPLE_COMPANY_ID: u16 = 0x004C;
 /// pairing data. The next bytes follow `02 15 03 02 <6-byte identity address>`.
 pub const APPLE_HID_MFR_PREFIX: [u8; 2] = [0x07, 0x0D];
 
-/// Single-button bit mask -> display name, in the order Python emits them.
-pub const BUTTON_NAMES: &[(u8, &str)] = &[
-    (0x01, "AirPlay"),
-    (0x02, "Volume Up"),
-    (0x04, "Volume Down"),
-    (0x08, "Play/Pause"),
-    (0x10, "Siri"),
-    (0x20, "Menu"),
-    (0x40, "Touchpad 2-Finger"),
-    (0x80, "Touchpad"),
+/// 16-bit button mask → display name for the gen-3 Siri Remote (model
+/// DNDJ22MG2330). Bits 0..7 come from byte 0 of the 2-byte HID Input report
+/// 0xFB (system buttons), bits 8..15 from byte 1 (clickpad directional
+/// clicks + Play/Pause). Empirically mapped — Apple does not publish the
+/// report layout. Bits not listed have not been observed during testing
+/// and decode to nothing.
+///
+/// The gen-1 / gen-2 remotes use a different (single-byte) layout; that
+/// firmware variant is out of scope for this decoder.
+pub const BUTTON_NAMES: &[(u16, &str)] = &[
+    (0x0001, "Select"),
+    (0x0002, "Volume Up"),
+    (0x0004, "Volume Down"),
+    (0x0008, "Mute"),
+    (0x0010, "Power"),
+    (0x0020, "Siri"),
+    (0x0040, "Back"),
+    (0x0080, "TV"),
+    (0x0100, "Play/Pause"),
+    (0x0200, "Up"),
+    (0x0400, "Down"),
+    (0x0800, "Left"),
+    (0x1000, "Right"),
 ];
-
-pub const BUTTON_TOUCHPAD: u8 = 0x80;
-pub const BUTTON_TOUCHPAD_2: u8 = 0x40;
-
-/// Byte that marks the third octet of a touch event payload.
-pub const TOUCH_EVENT_MARKER: u8 = 0x32;
 
 /// Map raw power-state byte to a human label, matching the Python `POWER_STATES` dict.
 pub fn power_state(value: u8) -> Option<&'static str> {
@@ -67,8 +74,8 @@ pub fn raw_hex(data: &[u8]) -> String {
 }
 
 /// Join the set bits in `mask` using the names from `BUTTON_NAMES`,
-/// returning the literal `"none"` for an empty mask (Python parity).
-pub fn button_list(mask: u8) -> String {
+/// returning the literal `"none"` for an empty mask.
+pub fn button_list(mask: u16) -> String {
     let mut out = String::new();
     for (bit, name) in BUTTON_NAMES {
         if mask & bit != 0 {
@@ -103,32 +110,17 @@ pub fn format_power(data: &[u8]) -> String {
     }
 }
 
-// -- Touch / input decoding ---------------------------------------------------
+// -- Button input decoding ----------------------------------------------------
 
-/// Decode a 7-byte finger payload into `(x, y, pressure)`.
+/// Stateful decoder for the gen-3 Siri Remote's 2-byte HID Input report
+/// (report id 0xFB). Tracks the previous button mask so every emitted line
+/// can spell out which buttons just transitioned.
 ///
-/// The arithmetic is a literal port of the formula from `events.py`. Python
-/// integer division of a float truncates toward zero; Rust's `as i32` cast
-/// of an `f64` does the same when the value is in range.
-pub fn decode_finger(data: &[u8]) -> anyhow::Result<(i32, i32, u8)> {
-    if data.len() != 7 {
-        anyhow::bail!("finger payload must be 7 bytes, got {}", data.len());
-    }
-    let raw = (data[0] as i32) + 255 * ((data[1] as i32) & 0x07) - 230;
-    let x = (raw as f64 / 15.0) as i32;
-    let y = (if data[2] & 0x80 != 0 {
-        data[2] as i32
-    } else {
-        (data[2] as i32) + 255
-    }) - 188;
-    let pressure = data[5];
-    Ok((x, y, pressure))
-}
-
-/// Stateful decoder for HID input reports. Tracks the previous button mask so
-/// every emitted line can spell out which buttons just transitioned.
+/// Multi-byte HID Input reports on this firmware (touch stream 0xFC,
+/// audio 0xFA, etc.) have not been reverse-engineered; callers should
+/// dump them raw rather than feeding them through this decoder.
 pub struct InputDecoder {
-    last_button: u8,
+    last_button: u16,
 }
 
 impl Default for InputDecoder {
@@ -142,83 +134,36 @@ impl InputDecoder {
         Self { last_button: 0 }
     }
 
-    /// Apply the touchpad re-mapping from `events.py`: when the report type
-    /// byte is `0x02`, the touchpad bit (`0x80`) actually means the
-    /// two-finger touchpad gesture (`0x40`).
-    fn normalized_button(data: &[u8]) -> Option<u8> {
-        if data.len() < 2 {
+    /// Read both bytes of a button report as a little-endian 16-bit mask.
+    /// Returns `None` for any payload that is not exactly 2 bytes.
+    fn mask(data: &[u8]) -> Option<u16> {
+        if data.len() != 2 {
             return None;
         }
-        let mut button = data[1];
-        if data[0] == 2 && button & BUTTON_TOUCHPAD != 0 {
-            button = (button & !BUTTON_TOUCHPAD) | BUTTON_TOUCHPAD_2;
-        }
-        Some(button)
+        Some(u16::from_le_bytes([data[0], data[1]]))
     }
 
-    /// Render a HID input payload. Returns either a `buttons=…; touch=…`
-    /// combined description or the `unknown HID packet len=N` fallback that
-    /// `events.py` emits when there is nothing recognizable.
+    /// Render a 2-byte HID button payload as a `buttons=…; pressed=…;
+    /// released=…` line. Returns the `unknown HID packet len=N` fallback
+    /// for any other shape, and the same fallback for repeated identical
+    /// states (i.e. a state-refresh packet that doesn't actually
+    /// transition any button).
     pub fn format(&mut self, payload: &[u8]) -> String {
-        let mut parts: Vec<String> = Vec::new();
-
-        if let Some(button) = Self::normalized_button(payload)
-            && button != self.last_button
-        {
-            let pressed = button & !self.last_button;
-            let released = self.last_button & !button;
-            parts.push(format!(
-                "buttons={} pressed={} released={}",
-                button_list(button),
-                button_list(pressed),
-                button_list(released),
-            ));
-            self.last_button = button;
-        }
-
-        if payload.len() >= 3
-            && payload[2] == TOUCH_EVENT_MARKER
-            && let Some(touch) = Self::format_touch(payload)
-        {
-            parts.push(touch);
-        }
-
-        if parts.is_empty() {
-            format!("unknown HID packet len={}", payload.len())
-        } else {
-            parts.join("; ")
-        }
-    }
-
-    fn format_touch(data: &[u8]) -> Option<String> {
-        if data.len() != 13 && data.len() != 20 {
-            return Some(format!("touch marker with unsupported len={}", data.len()));
-        }
-
-        let mut fingers: Vec<(i32, i32, u8)> = Vec::with_capacity(2);
-        fingers.push(decode_finger(&data[6..13]).ok()?);
-        if data.len() == 20 {
-            fingers.push(decode_finger(&data[13..20]).ok()?);
-        }
-
-        // Python f-string formats `bool` as `True` / `False`.
-        let pressed = if data[1] & BUTTON_TOUCHPAD != 0 {
-            "True"
-        } else {
-            "False"
+        let Some(button) = Self::mask(payload) else {
+            return format!("unknown HID packet len={}", payload.len());
         };
-        let expected_count = data[0];
-
-        let mut rendered = String::new();
-        for (i, (x, y, p)) in fingers.iter().enumerate() {
-            if i > 0 {
-                rendered.push_str(", ");
-            }
-            let _ = write!(rendered, "finger{}:x={x},y={y},pressure={p}", i + 1);
+        if button == self.last_button {
+            return format!("unknown HID packet len={}", payload.len());
         }
-        Some(format!(
-            "touch pressed={pressed} count={expected_count} {rendered}"
-        ))
+        let pressed = button & !self.last_button;
+        let released = self.last_button & !button;
+        self.last_button = button;
+        format!(
+            "buttons={} pressed={} released={}",
+            button_list(button),
+            button_list(pressed),
+            button_list(released),
+        )
     }
 }
 
@@ -267,16 +212,31 @@ mod tests {
 
     #[test]
     fn button_list_single_bit() {
-        assert_eq!(button_list(0x01), "AirPlay");
-        assert_eq!(button_list(0x80), "Touchpad");
+        // Byte-0 bits (system buttons).
+        assert_eq!(button_list(0x0001), "Select");
+        assert_eq!(button_list(0x0080), "TV");
+        // Byte-1 bits (clickpad directional + Play/Pause).
+        assert_eq!(button_list(0x0100), "Play/Pause");
+        assert_eq!(button_list(0x1000), "Right");
     }
 
     #[test]
     fn button_list_combination_in_table_order() {
-        // 0x82 = Volume Up | Touchpad — must appear in declaration order.
-        assert_eq!(button_list(0x82), "Volume Up+Touchpad");
-        // 0x03 = AirPlay | Volume Up.
-        assert_eq!(button_list(0x03), "AirPlay+Volume Up");
+        // Volume Up (0x0002) + Mute (0x0008) — must appear in declaration order.
+        assert_eq!(button_list(0x000A), "Volume Up+Mute");
+        // Select (0x0001) + Play/Pause (0x0100) — byte-0 entry first.
+        assert_eq!(button_list(0x0101), "Select+Play/Pause");
+        // Up (0x0200) + Down (0x0400) — both byte-1, in table order.
+        assert_eq!(button_list(0x0600), "Up+Down");
+    }
+
+    #[test]
+    fn button_list_ignores_unmapped_bits() {
+        // Byte 1 bits 0x2000..0x8000 are unobserved and must not produce
+        // phantom names.
+        assert_eq!(button_list(0xE000), "none");
+        // Mapped + unmapped: only the mapped bit renders.
+        assert_eq!(button_list(0x2001), "Select");
     }
 
     #[test]
@@ -296,62 +256,53 @@ mod tests {
     }
 
     #[test]
-    fn decode_finger_requires_seven_bytes() {
-        assert!(decode_finger(&[]).is_err());
-        assert!(decode_finger(&[0; 6]).is_err());
-        assert!(decode_finger(&[0; 8]).is_err());
-        assert!(decode_finger(&[0; 7]).is_ok());
-    }
-
-    #[test]
-    fn decode_finger_matches_python_arithmetic() {
-        // view[0]=100, view[1]&0x07=0: raw=-130, x=int(-130/15)=-8 (trunc to 0)
-        // view[2]=0x80 (high bit set), y = 0x80 - 188 = -60
-        // pressure = view[5] = 42
-        let f = decode_finger(&[100, 0, 0x80, 0, 0, 42, 0]).unwrap();
-        assert_eq!(f, (-8, -60, 42));
-
-        // view[0]=200, view[1]&0x07=2 (=0xA2), raw=200+510-230=480, x=32.
-        // view[2]=0 (high bit clear), y=(0+255)-188=67.
-        let f = decode_finger(&[200, 0xA2, 0, 0, 0, 7, 0]).unwrap();
-        assert_eq!(f, (32, 67, 7));
-    }
-
-    #[test]
     fn input_decoder_emits_press_then_release_diffs() {
         let mut d = InputDecoder::new();
 
-        // Initial state 0 -> Menu pressed (mask 0x20).
-        let line = d.format(&[0x01, 0x20]);
+        // Initial state 0 -> Back pressed (byte0 bit 0x40, mask 0x0040).
+        let line = d.format(&[0x40, 0x00]);
         assert!(
-            line.contains("buttons=Menu pressed=Menu released=none"),
+            line.contains("buttons=Back pressed=Back released=none"),
             "unexpected first transition line: {line}",
         );
 
-        // Menu held -> nothing changed; format returns the "unknown" fallback.
-        let line = d.format(&[0x01, 0x20]);
+        // Same state repeated -> "unknown HID packet" fallback (no change).
+        let line = d.format(&[0x40, 0x00]);
         assert!(
             line.starts_with("unknown HID packet len="),
             "no-change frame should yield the unknown fallback, got: {line}",
         );
 
-        // Menu released -> mask 0; pressed=none, released=Menu.
-        let line = d.format(&[0x01, 0x00]);
+        // Back released -> mask 0; pressed=none, released=Back.
+        let line = d.format(&[0x00, 0x00]);
         assert!(
-            line.contains("buttons=none pressed=none released=Menu"),
+            line.contains("buttons=none pressed=none released=Back"),
             "unexpected release line: {line}",
         );
     }
 
     #[test]
-    fn input_decoder_remaps_touchpad_on_type_2() {
+    fn input_decoder_combines_byte0_and_byte1_into_u16_mask() {
         let mut d = InputDecoder::new();
-        // Report type 2 + Touchpad bit (0x80) maps to two-finger (0x40).
-        let line = d.format(&[0x02, 0x80]);
+        // Up (byte1 bit 0x02 -> mask 0x0200) + Select (byte0 bit 0x01 -> 0x0001).
+        let line = d.format(&[0x01, 0x02]);
         assert!(
-            line.contains("buttons=Touchpad 2-Finger pressed=Touchpad 2-Finger"),
-            "report type 2 remap failed: {line}",
+            line.contains("buttons=Select+Up pressed=Select+Up released=none"),
+            "expected combined byte-0/byte-1 decode, got: {line}",
         );
+    }
+
+    #[test]
+    fn input_decoder_ignores_non_two_byte_payloads() {
+        let mut d = InputDecoder::new();
+        // The touch (0xFC) / audio (0xFA) reports must NOT be decoded as buttons.
+        let line = d.format(&[0x32, 0xFA, 0x99]);
+        assert!(
+            line.starts_with("unknown HID packet len="),
+            "non-button payload must fall through, got: {line}",
+        );
+        let line = d.format(&[]);
+        assert!(line.starts_with("unknown HID packet len="));
     }
 
     #[test]

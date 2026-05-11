@@ -5,3 +5,4 @@
 
 pub mod agent;
 pub mod device;
+pub mod hid;
