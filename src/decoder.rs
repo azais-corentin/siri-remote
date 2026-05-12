@@ -38,9 +38,9 @@ pub const BUTTON_NAMES: &[(u16, &str)] = &[
     (0x0080, "Mute"),
     (0x0100, "Play/Pause"),
     (0x0200, "Up"),
-    (0x0400, "Down"),
-    (0x0800, "Left"),
-    (0x1000, "Right"),
+    (0x0400, "Right"),
+    (0x0800, "Down"),
+    (0x1000, "Left"),
 ];
 
 /// Map raw power-state byte to a human label, matching the Python `POWER_STATES` dict.
@@ -504,7 +504,9 @@ mod tests {
         assert_eq!(button_list(0x0080), "Mute");
         // Byte-1 bits (clickpad directional + Play/Pause).
         assert_eq!(button_list(0x0100), "Play/Pause");
-        assert_eq!(button_list(0x1000), "Right");
+        assert_eq!(button_list(0x0400), "Right");
+        assert_eq!(button_list(0x0800), "Down");
+        assert_eq!(button_list(0x1000), "Left");
     }
 
     #[test]
@@ -513,8 +515,8 @@ mod tests {
         assert_eq!(button_list(0x000A), "Volume Up+Select");
         // TV (0x0001) + Play/Pause (0x0100) — byte-0 entry first.
         assert_eq!(button_list(0x0101), "TV+Play/Pause");
-        // Up (0x0200) + Down (0x0400) — both byte-1, in table order.
-        assert_eq!(button_list(0x0600), "Up+Down");
+        // Up (0x0200) + Right (0x0400) — both byte-1, in table order.
+        assert_eq!(button_list(0x0600), "Up+Right");
     }
 
     #[test]

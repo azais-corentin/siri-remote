@@ -266,9 +266,9 @@ fn draw_touchpad(ctx: &mut Context<'_>, state: &AppState, now: Instant) {
     // bezel, lit when their mask bits are set or in afterglow.
     let cardinals: [(u16, f64, f64); 4] = [
         (0x0200, center_x, center_y + radius - 4.0), // Up
-        (0x0400, center_x, center_y - radius + 4.0), // Down
-        (0x0800, center_x - radius + 4.0, center_y), // Left
-        (0x1000, center_x + radius - 4.0, center_y), // Right
+        (0x0400, center_x + radius - 4.0, center_y), // Right
+        (0x0800, center_x, center_y - radius + 4.0), // Down
+        (0x1000, center_x - radius + 4.0, center_y), // Left
     ];
     for (bit, x, y) in cardinals {
         let c = style_for_bit(state, bit, now);
