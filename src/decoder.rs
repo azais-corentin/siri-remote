@@ -201,11 +201,12 @@ pub const TOUCH_REPORT_LEN_1F: usize = 11;
 /// for slot 2.
 pub const TOUCH_REPORT_LEN_2F: usize = 18;
 
-/// Bit in byte 3 set when slot 1 (primary finger) is in contact.
-pub const FINGER_SLOT_1_MASK: u8 = 0x01;
-/// Bit in byte 3 set when slot 2 (secondary finger) is in contact.
-/// Empirically only ever observed together with the slot-1 bit.
-pub const FINGER_SLOT_2_MASK: u8 = 0x10;
+// Byte 3 of the touchpad report (previously read as a per-slot presence
+// mask via `FINGER_SLOT_1_MASK = 0x01` / `FINGER_SLOT_2_MASK = 0x10`) is
+// surfaced raw on `TouchEvent::finger_mask` but no longer drives slot
+// gating. Empirically it is `0x00` during real contact frames where the
+// per-slot pressure byte is non-zero, so we use that pressure byte as
+// the authoritative presence signal instead.
 
 /// Y-axis offset baked into the firmware's wire encoding.
 ///
@@ -238,12 +239,15 @@ pub const TOUCH_X_PERIOD: i32 = 2040;
 /// One decoded touchpad sample. Up to two simultaneous fingers are
 /// reported — slot indices match the firmware's wire layout (slot 1 at
 /// bytes 4..10, slot 2 at bytes 11..17). Released frames carry the
-/// 11-byte payload with `finger_mask == 0` and no point data.
+/// 11-byte payload with every per-slot pressure byte at zero and no
+/// active points.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TouchEvent {
-    /// Raw byte 3. Bit 0 set ⇒ slot 1 active; bit 4 set ⇒ slot 2 active.
-    /// Surfaced so callers can distinguish "released and decaying" frames
-    /// from "idle" frames without re-deriving from `points`.
+    /// Raw byte 3 of the touchpad report. Surfaced as an opaque
+    /// diagnostic field; previously misread as a slot presence mask,
+    /// but empirically it is `0x00` during real contact frames too,
+    /// so it does **not** gate `points`. Slot presence comes from the
+    /// per-slot pressure byte instead.
     pub finger_mask: u8,
     /// Little-endian 16-bit packet counter from bytes 1..2. Increments
     /// by `0x1E` per frame at the ~15 ms native rate, wraps at 0xFFFF.
@@ -363,9 +367,11 @@ impl TouchDecoder {
     /// or missing the `0x32` marker); the caller should fall back to a
     /// raw-hex dump in that case.
     ///
-    /// Slots that are inactive in the returned event have their
-    /// per-slot unwrap state reset, so a subsequent contact starts
-    /// from a clean offset of zero.
+    /// Slot presence is gated on the per-slot pressure byte (index 5
+    /// of the 7-byte finger slice). Slots with zero pressure are
+    /// emitted as `None` and have their unwrap state reset, so a
+    /// subsequent contact starts from a clean offset of zero. Slot 2
+    /// is always `None` on the 11-byte single-finger layout.
     pub fn parse(&mut self, payload: &[u8]) -> Option<TouchEvent> {
         let len = payload.len();
         if (len != TOUCH_REPORT_LEN_1F && len != TOUCH_REPORT_LEN_2F)
@@ -374,19 +380,11 @@ impl TouchDecoder {
             return None;
         }
         let finger_mask = payload[3];
-        // A slot-2 mask bit on a short payload would force an OOB
-        // read; reject the frame entirely (no observed case).
-        if finger_mask & FINGER_SLOT_2_MASK != 0 && len < TOUCH_REPORT_LEN_2F {
-            return None;
-        }
         let seq = u16::from_le_bytes([payload[1], payload[2]]);
         let points = [
-            self.decode_or_reset(0, finger_mask & FINGER_SLOT_1_MASK != 0, &payload[4..11]),
-            // Slot 2 only exists in the 18-byte layout; pass an empty
-            // slice for the inactive case so `decode_or_reset` clears
-            // any stale state without touching the buffer.
+            self.decode_or_reset(0, &payload[4..11]),
             if len == TOUCH_REPORT_LEN_2F {
-                self.decode_or_reset(1, finger_mask & FINGER_SLOT_2_MASK != 0, &payload[11..18])
+                self.decode_or_reset(1, &payload[11..18])
             } else {
                 self.reset(1);
                 None
@@ -399,8 +397,12 @@ impl TouchDecoder {
         })
     }
 
-    fn decode_or_reset(&mut self, slot: usize, active: bool, b: &[u8]) -> Option<FingerData> {
-        if !active {
+    /// Decode one slot's 7-byte slice if it is in contact (pressure
+    /// byte non-zero); otherwise reset the per-slot unwrap state and
+    /// emit `None`. Byte 3 of the report header is intentionally
+    /// ignored — see the constant block at the top of this module.
+    fn decode_or_reset(&mut self, slot: usize, b: &[u8]) -> Option<FingerData> {
+        if b[5] == 0 {
             self.reset(slot);
             return None;
         }
@@ -701,13 +703,62 @@ mod tests {
     }
 
     #[test]
-    fn touch_parse_rejects_slot2_bit_on_short_payload() {
-        // Mask claims slot 2 is active but payload only has 11 bytes —
-        // refuse to read past the buffer.
+    fn touch_parse_decodes_slot1_when_mask_byte_zero() {
+        // Captured during a real swipe on a DNDJ22MG2330: byte 3 is
+        // `0x00` (the firmware's misnamed "finger mask") but the
+        // finger is still on the pad — slot-1 pressure is 0x15. The
+        // decoder must surface the position, not classify this as a
+        // release.
         let bytes = [
-            0x32, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x32, 0x7a, 0xfc, 0x00, 0x7b, 0xdf, 0x00, 0x84, 0x8a, 0x15, 0x6c,
         ];
-        assert!(TouchDecoder::new().parse(&bytes).is_none());
+        let ev = TouchDecoder::new().parse(&bytes).expect("valid touch packet");
+        assert_eq!(ev.finger_mask, 0x00, "byte 3 stays surfaced as-is");
+        assert_eq!(ev.finger_count(), 1, "pressure>0 ⇒ slot 1 in contact");
+        let f = ev.points[0].expect("slot 1 must decode despite mask=0x00");
+        assert_eq!(f.x, 0x7b + 255 * 7, "x = byte0 + 255 * (byte1 & 7)");
+        // b[2] = 0x00 has bit 7 clear, so y decodes via the `+255` wrap branch.
+        assert_eq!(f.y, 255 - TOUCH_Y_OFFSET);
+        assert_eq!(f.pressure, 0x15);
+        assert_eq!(f.status, 0x6c);
+        assert_eq!(f.aux, [0x84, 0x8a]);
+        assert_eq!(f.byte1_high, 0xdf >> 3);
+        assert!(ev.points[1].is_none(), "slot 2 stays empty on 11-byte payload");
+    }
+
+    #[test]
+    fn touch_parse_releases_slot1_when_pressure_zero_even_if_byte3_nonzero() {
+        // Final mid-swipe frame from a real capture: byte 3 still
+        // reports `0x01` but slot-1 pressure has dropped to 0, i.e.
+        // the finger has effectively left the pad. Pressure is the
+        // authoritative presence signal, so the slot must release.
+        let bytes = [
+            0x32, 0x44, 0x81, 0x01, 0x26, 0x41, 0xe2, 0x2f, 0x08, 0x00, 0x6e,
+        ];
+        let ev = TouchDecoder::new().parse(&bytes).expect("valid touch packet");
+        assert_eq!(ev.finger_mask, 0x01);
+        assert_eq!(ev.finger_count(), 0, "pressure=0 ⇒ slot 1 released");
+        assert!(ev.points[0].is_none());
+        assert!(ev.points[1].is_none());
+    }
+
+    #[test]
+    fn touch_parse_decodes_slot2_when_slot1_pressure_zero() {
+        // 18-byte capture where slot 1's pressure has fallen to 0
+        // mid-gesture but slot 2 is still in contact (pressure 0x03).
+        // Slot presence is per-slot, so the decoder must emit slot 2
+        // and drop slot 1.
+        let bytes = [
+            0x32, 0x24, 0x09, 0x00, 0xcb, 0xed, 0xea, 0x00, 0x00, 0x00, 0x68,
+            0x71, 0x3e, 0x00, 0x8b, 0x63, 0x03, 0x01,
+        ];
+        let ev = TouchDecoder::new().parse(&bytes).expect("valid touch packet");
+        assert_eq!(ev.finger_mask, 0x00);
+        assert_eq!(ev.finger_count(), 1);
+        assert!(ev.points[0].is_none(), "slot 1 pressure is 0");
+        let f2 = ev.points[1].expect("slot 2 must remain active");
+        assert_eq!(f2.pressure, 0x03);
+        assert_eq!(f2.status, 0x01);
     }
 
     #[test]
