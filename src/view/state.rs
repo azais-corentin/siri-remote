@@ -450,6 +450,8 @@ mod tests {
             minor: 0x20,
             pressure: 0x20,
             flags: 0,
+            hover: false,
+            angle_idx: 0,
         }
     }
 

@@ -237,7 +237,7 @@ pub struct TouchEvent {
 /// | 3    | major (contact-ellipse long axis) |
 /// | 4    | minor (contact-ellipse short axis) |
 /// | 5    | pressure |
-/// | 6    | flags (touch state / quadrant hints, not fully decoded) |
+/// | 6    | flags (bit 1 = hover; bits 5..7 = ellipse orientation index, `angle_deg = idx * 22.5`; bits 0/2/3/4 undecoded) |
 ///
 /// X and Y are 12-bit two's-complement values reconstructed from
 /// bytes 0..2 (see [`decode_coord`]); both sit in `-2048..=2047`.
@@ -263,9 +263,30 @@ pub struct FingerData {
     /// during the final lift-off frame even while contact size is
     /// still non-zero.
     pub pressure: u8,
-    /// Flags byte (byte 6 of the slot). Empirically mixes touch state
-    /// with quadrant hints; not fully decoded, surfaced raw.
+    /// Flags byte (byte 6 of the slot). Bit 1 is decoded as
+    /// [`Self::hover`]; bits 5..7 are decoded as
+    /// [`Self::angle_idx`]. Bits 0, 2, 3, 4 are still unidentified
+    /// and surfaced raw here for future analysis.
     pub flags: u8,
+    /// Hover bit (bit 1 of `flags`). `true` while the finger is close
+    /// to the surface but not yet registered as a firm contact;
+    /// clears once contact is established.
+    pub hover: bool,
+    /// Ellipse orientation index (bits 5..7 of `flags`, 0..=7). The
+    /// firmware quantizes the ellipse angle into eight 22.5° buckets;
+    /// see [`Self::angle_deg`] for the calibrated degree value
+    /// (empirical +1 bucket shift). 180° wraps to 0°.
+    pub angle_idx: u8,
+}
+
+impl FingerData {
+    /// Ellipse orientation in degrees, derived from
+    /// [`Self::angle_idx`] with an empirical `+1` bucket shift
+    /// (visually verified against live touches). Quantized to 22.5°
+    /// steps in `0.0..=157.5`; idx 7 wraps back to `0.0`.
+    pub fn angle_deg(&self) -> f32 {
+        ((self.angle_idx + 1) % 8) as f32 * 22.5
+    }
 }
 
 impl TouchEvent {
@@ -292,8 +313,15 @@ impl TouchEvent {
                 let _ = write!(
                     out,
                     " [{slot_no}: x={} y={} pressure={} flags=0x{:02x} \
-                     major={} minor={}]",
-                    f.x, f.y, f.pressure, f.flags, f.major, f.minor,
+                     hover={} angle={:.1}° major={} minor={}]",
+                    f.x,
+                    f.y,
+                    f.pressure,
+                    f.flags,
+                    f.hover,
+                    f.angle_deg(),
+                    f.major,
+                    f.minor,
                 );
             }
         }
@@ -411,13 +439,16 @@ pub fn decode_coord(coord_bytes: [u8; 3]) -> Coord {
 /// [`decode_coord`] for bytes 0..3.
 fn decode_slot(b: &[u8]) -> FingerData {
     let Coord { x, y } = decode_coord([b[0], b[1], b[2]]);
+    let flags = b[6];
     FingerData {
         x,
         y,
         major: b[3],
         minor: b[4],
         pressure: b[5],
-        flags: b[6],
+        flags,
+        hover: flags & 0b0000_0010 != 0,
+        angle_idx: (flags >> 5) & 0x07,
     }
 }
 
@@ -611,6 +642,9 @@ mod tests {
         assert_eq!(f.minor, 0x8e);
         assert_eq!(f.pressure, 0x1a);
         assert_eq!(f.flags, 0xa4);
+        assert!(!f.hover);
+        assert_eq!(f.angle_idx, 5);
+        assert_eq!(f.angle_deg(), 135.0);
         assert!(ev.points[1].is_none(), "slot 2 must be empty in 11-byte payload");
     }
 
@@ -631,6 +665,9 @@ mod tests {
         assert_eq!(f.minor, 7);
         assert_eq!(f.pressure, 3);
         assert_eq!(f.flags, 0x62);
+        assert!(f.hover, "0x62 has bit 1 set");
+        assert_eq!(f.angle_idx, 3);
+        assert_eq!(f.angle_deg(), 90.0);
     }
 
     #[test]
@@ -671,6 +708,9 @@ mod tests {
         assert_eq!(f1.minor, 0x5a);
         assert_eq!(f1.pressure, 0x0f);
         assert_eq!(f1.flags, 0x8b);
+        assert!(f1.hover, "0x8b has bit 1 set");
+        assert_eq!(f1.angle_idx, 4);
+        assert_eq!(f1.angle_deg(), 112.5);
         let f2 = ev.points[1].expect("slot 2 active");
         // packed = 0x41 | (0x0d<<8) | (0xe2<<16) = 0xe20d41
         // x_u12 = packed & 0xfff = 0xd41 → sign-ext → -703.
@@ -681,6 +721,9 @@ mod tests {
         assert_eq!(f2.minor, 0x55);
         assert_eq!(f2.pressure, 0x0e);
         assert_eq!(f2.flags, 0x83);
+        assert!(f2.hover, "0x83 has bit 1 set");
+        assert_eq!(f2.angle_idx, 4);
+        assert_eq!(f2.angle_deg(), 112.5);
     }
 
     #[test]
@@ -704,6 +747,9 @@ mod tests {
         assert_eq!(f.minor, 0x8a);
         assert_eq!(f.pressure, 0x15);
         assert_eq!(f.flags, 0x6c);
+        assert!(!f.hover, "0x6c bit 1 clear");
+        assert_eq!(f.angle_idx, 3);
+        assert_eq!(f.angle_deg(), 90.0);
         assert!(ev.points[1].is_none(), "slot 2 stays empty on 11-byte payload");
     }
 
@@ -724,6 +770,9 @@ mod tests {
         assert_eq!(f.minor, 0x08);
         assert_eq!(f.pressure, 0x00);
         assert_eq!(f.flags, 0x6e);
+        assert!(f.hover, "0x6e has bit 1 set");
+        assert_eq!(f.angle_idx, 3);
+        assert_eq!(f.angle_deg(), 90.0);
         assert!(ev.points[1].is_none());
     }
 
@@ -750,6 +799,9 @@ mod tests {
         assert_eq!(f2.minor, 0x63);
         assert_eq!(f2.pressure, 0x03);
         assert_eq!(f2.flags, 0x01);
+        assert!(!f2.hover, "0x01 bit 1 clear");
+        assert_eq!(f2.angle_idx, 0);
+        assert_eq!(f2.angle_deg(), 22.5);
     }
 
     #[test]
@@ -768,6 +820,8 @@ mod tests {
             "missing decoded slot-1 position: {line}",
         );
         assert!(line.contains("flags=0xa4"), "missing flags: {line}");
+        assert!(line.contains("hover=false"), "missing hover: {line}");
+        assert!(line.contains("angle=135.0°"), "missing angle: {line}");
         assert!(line.contains("major=158"), "missing major: {line}");
         assert!(line.contains("minor=142"), "missing minor: {line}");
         assert!(line.contains("header=0x01"), "missing header: {line}");
@@ -786,6 +840,8 @@ mod tests {
         assert!(line.contains("[1: x=119 y=-122 pressure=15"), "{line}");
         assert!(line.contains("[2: x=-703 y=-480 pressure=14"), "{line}");
         assert!(line.contains("header=0x11"), "{line}");
+        assert!(line.contains("hover=true"), "{line}");
+        assert!(line.contains("angle=112.5°"), "{line}");
     }
 
     #[test]
@@ -798,6 +854,53 @@ mod tests {
         assert!(line.starts_with("touch released"), "expected released prefix: {line}");
         assert!(!line.contains(" x="), "released frame must not advertise x/y: {line}");
         assert!(line.contains("header=0x00"));
+    }
+
+    #[test]
+    fn flags_decode_hover_and_angle() {
+        // Build a synthetic slot trailer with a fixed coordinate +
+        // contact gate, only varying the flags byte.
+        fn slot_with_flags(flags: u8) -> FingerData {
+            decode_slot(&[0x00, 0x00, 0x00, 0x01, 0x01, 0x01, flags])
+        }
+
+        // Bit 1 toggles `hover` regardless of other bits.
+        assert!(!slot_with_flags(0b0000_0000).hover);
+        assert!(slot_with_flags(0b0000_0010).hover);
+        assert!(slot_with_flags(0xff).hover, "all-ones still hovers");
+        assert!(!slot_with_flags(0xfd).hover, "all-ones minus bit 1");
+
+        // Each of the 8 angle buckets maps to a 22.5° step.
+        for idx in 0..8u8 {
+            let flags = idx << 5;
+            let f = slot_with_flags(flags);
+            assert_eq!(f.angle_idx, idx, "flags=0x{flags:02x}");
+            assert_eq!(
+                f.angle_deg(),
+                ((idx + 1) % 8) as f32 * 22.5,
+                "flags=0x{flags:02x}",
+            );
+        }
+
+        // Real-capture flags bytes used elsewhere in the test corpus.
+        for (flags, hover, idx) in [
+            (0xa4u8, false, 5u8),
+            (0x62, true, 3),
+            (0x8b, true, 4),
+            (0x83, true, 4),
+            (0x6c, false, 3),
+            (0x6e, true, 3),
+            (0x01, false, 0),
+        ] {
+            let f = slot_with_flags(flags);
+            assert_eq!(f.hover, hover, "flags=0x{flags:02x}");
+            assert_eq!(f.angle_idx, idx, "flags=0x{flags:02x}");
+            assert_eq!(
+                f.angle_deg(),
+                ((idx + 1) % 8) as f32 * 22.5,
+                "flags=0x{flags:02x}",
+            );
+        }
     }
 
     #[test]

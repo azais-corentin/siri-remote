@@ -26,6 +26,10 @@ use crate::view::state::{
 // than 3:1, but a 3:1 plot reads better at the terminal cell aspect.
 const W: f64 = 100.0;
 const H: f64 = 300.0;
+/// Ellipse axis scale: semi-axis (canvas units) = `major_or_minor * SCALE`.
+/// `0.8 * radius / 256.0` ≈ 0.0938 — a mid-swipe contact (major ≈ 0x70,
+/// minor ≈ 0x60) spans roughly a quarter of the touchpad ring.
+const TOUCH_ELLIPSE_AXIS_SCALE: f64 = 0.8 * 30.0 / 256.0;
 
 const MIN_COLS: u16 = 70;
 const MIN_ROWS: u16 = 24;
@@ -109,6 +113,10 @@ fn paint_remote(ctx: &mut Context<'_>, state: &AppState) {
 
     // 5. Touch trail.
     draw_trail(ctx, &state.touch_trail, now);
+    ctx.layer();
+
+    // 5a. Current-frame contact ellipses (per active slot).
+    draw_contact_ellipses(ctx, state);
     ctx.layer();
 
     // 5b. Running calibration bounds overlay (firmware-space rectangle
@@ -318,6 +326,56 @@ fn draw_trail(ctx: &mut Context<'_>, trail: &std::collections::VecDeque<TrailPoi
     }
 }
 
+/// Render the current-frame contact ellipse for each active slot.
+///
+/// Sourced from `state.last_touch` so the ellipse reflects this frame's
+/// major/minor/angle, independent of the historical trail. Slot 1 →
+/// `LightCyan`, slot 2 → `LightMagenta`; hovering slots recolor to
+/// `DarkGray` so the "near-but-not-touching" state is visually distinct.
+fn draw_contact_ellipses(ctx: &mut Context<'_>, state: &AppState) {
+    let Some(touch) = state.last_touch.as_ref() else {
+        return;
+    };
+    let center_x = 50.0_f64;
+    let center_y = 230.0_f64;
+    let radius = 30.0_f64;
+
+    const SAMPLES: usize = 32;
+    let slot_colors = [Color::LightCyan, Color::LightMagenta];
+
+    for (idx, slot) in touch.points.iter().enumerate() {
+        let Some(f) = slot else { continue };
+        let Some((nx, ny)) = crate::view::state::normalize_finger(f, &state.calibration)
+        else {
+            continue;
+        };
+        let cx = center_x + (nx - 0.5) * 2.0 * radius;
+        let cy = center_y + (ny - 0.5) * 2.0 * radius;
+        let a = f64::from(f.major) * TOUCH_ELLIPSE_AXIS_SCALE;
+        let b = f64::from(f.minor) * TOUCH_ELLIPSE_AXIS_SCALE;
+        let theta = f64::from(f.angle_deg()).to_radians();
+        let (sin_t, cos_t) = theta.sin_cos();
+
+        let mut coords: [(f64, f64); SAMPLES] = [(0.0, 0.0); SAMPLES];
+        for (k, slot_pt) in coords.iter_mut().enumerate() {
+            let u = std::f64::consts::TAU * (k as f64) / (SAMPLES as f64);
+            let (sin_u, cos_u) = u.sin_cos();
+            let dx = a * cos_u * cos_t - b * sin_u * sin_t;
+            let dy = a * cos_u * sin_t + b * sin_u * cos_t;
+            *slot_pt = (cx + dx, cy + dy);
+        }
+        let color = if f.hover {
+            Color::DarkGray
+        } else {
+            slot_colors[idx.min(1)]
+        };
+        ctx.draw(&Points {
+            coords: &coords,
+            color,
+        });
+    }
+}
+
 /// While calibrating, draw a yellow rectangle over the touchpad disc
 /// showing how much of the pad the running session has covered. Both
 /// axes are linear, so the rectangle spans the running `(x_min, x_max)`
@@ -351,6 +409,8 @@ fn draw_calibration_overlay(ctx: &mut Context<'_>, state: &AppState) {
             minor: 0x20,
             pressure: 0x20,
             flags: 0,
+            hover: false,
+            angle_idx: 0,
         };
         normalize_finger(&f, &default_cal).map(|(nx, ny)| {
             (
@@ -697,12 +757,14 @@ fn draw_touch_readout(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
                 if let Some(f) = slot {
                     lines.push(Line::from(format!(
                         "  slot {}: x={} y={} pressure=0x{:02X} flags=0x{:02X} \
-                         major={} minor={}",
+                         hover={} angle={:.1}° major={} minor={}",
                         idx + 1,
                         f.x,
                         f.y,
                         f.pressure,
                         f.flags,
+                        f.hover,
+                        f.angle_deg(),
                         f.major,
                         f.minor,
                     )));
