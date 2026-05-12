@@ -227,13 +227,15 @@ pub const TOUCH_X_ZONES: u8 = 8;
 /// Mask that picks the zone bits out of finger byte [1].
 pub const TOUCH_X_ZONE_MASK: u8 = 0x07;
 
-/// Maximum value the encoded X can take (`255 * (TOUCH_X_ZONES - 1) + 255`).
-/// Higher physical motion wraps back to small X values.
-/// Period of the firmware's X wrap. Adding or subtracting this many
-/// units inside [`TouchDecoder`] recovers the cyclic raw form: as the
-/// finger sweeps past zone 7's high end, the firmware's encoded X drops
-/// from `~2040` back to `~0`, so we unwrap by tracking the previous
-/// raw value per slot.
+/// Period of the firmware's X wrap.
+///
+/// The encoded X (`byte[0] + 255 * (byte[1] & 7)`) is a cyclic 11-bit
+/// value in `0..TOUCH_X_PERIOD`. Both physical edges of the touchpad
+/// fall inside this cycle (the wrap point sits **on** the pad, not
+/// outside it), so the decoder reports `x` as the raw cyclic value and
+/// leaves the cyclic interpretation to the caller — any attempt to
+/// extend `x` into a monotonic `i32` produces direction-dependent
+/// coordinates for the same physical position.
 pub const TOUCH_X_PERIOD: i32 = 2040;
 
 /// One decoded touchpad sample. Up to two simultaneous fingers are
@@ -267,12 +269,17 @@ pub struct TouchEvent {
 /// SiriRemote-Linux reference, confirmed empirically on gen-3.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FingerData {
-    /// Continuous horizontal position decoded from finger bytes [0]
-    /// and the lower three bits of byte [1]. The firmware reports a
-    /// cyclic 11-bit value in `0..=TOUCH_X_PERIOD`; [`TouchDecoder`]
-    /// detects each zone wrap and adds a per-slot offset, so this
-    /// field grows monotonically across one continuous swipe and only
-    /// resets when the finger lifts. Increases left-to-right.
+    /// Raw cyclic horizontal position decoded from finger bytes [0]
+    /// and the lower three bits of byte [1]:
+    /// `x = byte[0] + 255 * (byte[1] & 7)`, in `0..TOUCH_X_PERIOD`.
+    ///
+    /// The encoding is cyclic and the wrap point falls **inside** the
+    /// physical touchpad, so the same physical X always decodes to the
+    /// same value regardless of motion history — but adjacent physical
+    /// positions can straddle the 2040↔0 boundary. Callers that need
+    /// distance or velocity must take the shorter cyclic delta
+    /// (`((b - a + period/2).rem_euclid(period)) - period/2`) rather
+    /// than subtract directly.
     pub x: i32,
     /// Vertical position relative to the firmware's `188` offset.
     /// Increases bottom-to-top; sits roughly in `0..=106` across the
@@ -329,24 +336,14 @@ impl TouchEvent {
     }
 }
 
-/// Stateful parser for the touchpad HID Input report (id `0xFC`).
+/// Parser for the touchpad HID Input report (id `0xFC`).
 ///
-/// The firmware's X encoding is cyclic: `byte[0] + 255 * (byte[1] & 7)`
-/// produces an 11-bit value that wraps from `~TOUCH_X_PERIOD` back to
-/// `~0` whenever the finger crosses the zone-7 boundary. This decoder
-/// tracks the previous raw X per slot, detects each wrap, and emits a
-/// continuous extended `i32` X. Per-slot state resets when the slot
-/// transitions from active to inactive (finger lift), so each fresh
-/// contact begins inside `0..=TOUCH_X_PERIOD`.
-pub struct TouchDecoder {
-    /// Last raw 11-bit X observed for each slot. `None` when the slot
-    /// was inactive in the previous frame (i.e. the next touch is a
-    /// fresh contact, with no continuity to preserve).
-    prev_raw_x: [Option<u16>; 2],
-    /// Cumulative wrap offset (multiples of `TOUCH_X_PERIOD`) added to
-    /// the raw X to recover a continuous extended position.
-    offset: [i32; 2],
-}
+/// Stateless — kept as a struct only because callers thread it through
+/// the session loop alongside [`InputDecoder`]. The X encoding is
+/// cyclic with the wrap point on the physical pad (see
+/// [`TOUCH_X_PERIOD`]), so [`FingerData::x`] is always the raw 11-bit
+/// value; no per-slot history is required or kept.
+pub struct TouchDecoder;
 
 impl Default for TouchDecoder {
     fn default() -> Self {
@@ -356,10 +353,7 @@ impl Default for TouchDecoder {
 
 impl TouchDecoder {
     pub fn new() -> Self {
-        Self {
-            prev_raw_x: [None, None],
-            offset: [0, 0],
-        }
+        Self
     }
 
     /// Try to parse one touchpad HID Input report. Returns `None` for
@@ -369,9 +363,8 @@ impl TouchDecoder {
     ///
     /// Slot presence is gated on the per-slot pressure byte (index 5
     /// of the 7-byte finger slice). Slots with zero pressure are
-    /// emitted as `None` and have their unwrap state reset, so a
-    /// subsequent contact starts from a clean offset of zero. Slot 2
-    /// is always `None` on the 11-byte single-finger layout.
+    /// emitted as `None`. Slot 2 is always `None` on the 11-byte
+    /// single-finger layout.
     pub fn parse(&mut self, payload: &[u8]) -> Option<TouchEvent> {
         let len = payload.len();
         if (len != TOUCH_REPORT_LEN_1F && len != TOUCH_REPORT_LEN_2F)
@@ -382,11 +375,10 @@ impl TouchDecoder {
         let finger_mask = payload[3];
         let seq = u16::from_le_bytes([payload[1], payload[2]]);
         let points = [
-            self.decode_or_reset(0, &payload[4..11]),
+            decode_slot_if_active(&payload[4..11]),
             if len == TOUCH_REPORT_LEN_2F {
-                self.decode_or_reset(1, &payload[11..18])
+                decode_slot_if_active(&payload[11..18])
             } else {
-                self.reset(1);
                 None
             },
         ];
@@ -396,79 +388,57 @@ impl TouchDecoder {
             points,
         })
     }
+}
 
-    /// Decode one slot's 7-byte slice if it is in contact (pressure
-    /// byte non-zero); otherwise reset the per-slot unwrap state and
-    /// emit `None`. Byte 3 of the report header is intentionally
-    /// ignored — see the constant block at the top of this module.
-    fn decode_or_reset(&mut self, slot: usize, b: &[u8]) -> Option<FingerData> {
-        if b[5] == 0 {
-            self.reset(slot);
-            return None;
-        }
-        Some(self.decode_slot(slot, b))
+/// Decode one slot's 7-byte slice if it is in contact (pressure byte
+/// non-zero); otherwise emit `None`. Byte 3 of the report header is
+/// intentionally ignored — see the constant block at the top of this
+/// module.
+fn decode_slot_if_active(b: &[u8]) -> Option<FingerData> {
+    if b[5] == 0 {
+        return None;
     }
+    Some(decode_slot(b))
+}
 
-    /// Decode the 7-byte per-slot finger payload, unwrapping X across
-    /// the firmware's zone period using this slot's previous reading.
-    ///
-    /// Layout per `SiriRemote-Linux/README.md` (gen-2 wire format,
-    /// confirmed empirically on the gen-3 DNDJ22MG2330):
-    ///
-    /// | byte | role |
-    /// |------|------|
-    /// | 0    | X low byte (within zone) |
-    /// | 1    | bits 0..2: X zone (`& 7`); bits 3..7: unknown counter |
-    /// | 2    | Y signed wrap byte, offset by `188` |
-    /// | 3    | unknown (co-varies with pressure / contact size) |
-    /// | 4    | unknown (co-varies with pressure / contact size) |
-    /// | 5    | pressure |
-    /// | 6    | status / quadrant flags |
-    fn decode_slot(&mut self, slot: usize, b: &[u8]) -> FingerData {
-        let zone = (b[1] & TOUCH_X_ZONE_MASK) as u16;
-        debug_assert!(zone < TOUCH_X_ZONES as u16);
-        let raw_x = b[0] as u16 + 255 * zone;
+/// Decode the 7-byte per-slot finger payload.
+///
+/// Layout per `SiriRemote-Linux/README.md` (gen-2 wire format,
+/// confirmed empirically on the gen-3 DNDJ22MG2330):
+///
+/// | byte | role |
+/// |------|------|
+/// | 0    | X low byte (within zone) |
+/// | 1    | bits 0..2: X zone (`& 7`); bits 3..7: unknown counter |
+/// | 2    | Y signed wrap byte, offset by `188` |
+/// | 3    | unknown (co-varies with pressure / contact size) |
+/// | 4    | unknown (co-varies with pressure / contact size) |
+/// | 5    | pressure |
+/// | 6    | status / quadrant flags |
+fn decode_slot(b: &[u8]) -> FingerData {
+    let zone = (b[1] & TOUCH_X_ZONE_MASK) as u16;
+    debug_assert!(zone < TOUCH_X_ZONES as u16);
+    let x = b[0] as i32 + 255 * zone as i32;
+    debug_assert!((0..TOUCH_X_PERIOD).contains(&x));
 
-        // Wrap detection: any single-frame jump larger than half the
-        // period is overwhelmingly more likely to be a zone wrap than
-        // real finger motion (~16 ms between frames; the finger cannot
-        // cross half the touchpad in one frame at human speeds).
-        if let Some(prev) = self.prev_raw_x[slot] {
-            let delta = raw_x as i32 - prev as i32;
-            if delta < -(TOUCH_X_PERIOD / 2) {
-                self.offset[slot] += TOUCH_X_PERIOD;
-            } else if delta > TOUCH_X_PERIOD / 2 {
-                self.offset[slot] -= TOUCH_X_PERIOD;
-            }
-        }
-        self.prev_raw_x[slot] = Some(raw_x);
-        let x = raw_x as i32 + self.offset[slot];
+    // Y mirrors the SiriRemote-Linux Python decoder:
+    //   (b if b & 0x80 else b + 255) - 188
+    // i.e. "treat byte as signed offset around 188", with the
+    // `0..127` half shifted up by 255 so the wrap point sits
+    // outside the touchpad's active area.
+    let y = if b[2] & 0x80 != 0 {
+        b[2] as i16 - TOUCH_Y_OFFSET
+    } else {
+        b[2] as i16 + 255 - TOUCH_Y_OFFSET
+    };
 
-        // Y mirrors the SiriRemote-Linux Python decoder:
-        //   (b if b & 0x80 else b + 255) - 188
-        // i.e. "treat byte as signed offset around 188", with the
-        // `0..127` half shifted up by 255 so the wrap point sits
-        // outside the touchpad's active area.
-        let y = if b[2] & 0x80 != 0 {
-            b[2] as i16 - TOUCH_Y_OFFSET
-        } else {
-            b[2] as i16 + 255 - TOUCH_Y_OFFSET
-        };
-
-        FingerData {
-            x,
-            y,
-            pressure: b[5],
-            status: b[6],
-            aux: [b[3], b[4]],
-            byte1_high: b[1] >> 3,
-        }
-    }
-
-    fn reset(&mut self, slot: usize) -> Option<FingerData> {
-        self.prev_raw_x[slot] = None;
-        self.offset[slot] = 0;
-        None
+    FingerData {
+        x,
+        y,
+        pressure: b[5],
+        status: b[6],
+        aux: [b[3], b[4]],
+        byte1_high: b[1] >> 3,
     }
 }
 
@@ -827,55 +797,55 @@ mod tests {
     }
 
     #[test]
-    fn touch_decoder_unwraps_x_across_zone_boundary() {
+    fn touch_decoder_reports_raw_cyclic_x_across_zone_wrap() {
+        // Crossing zone 7 → zone 0 going right (encoded 2037 → 37) is a
+        // real physical position change, not a coordinate fix-up. The
+        // decoder reports the raw cyclic value both before and after.
         let mut d = TouchDecoder::new();
-        // First frame near the high end of zone 7: raw X = 251 + 255*7 = 2036.
-        let f0 = d.parse(&touch_packet(0, 0xFB, 0x07, 0xE6)).unwrap().points[0].unwrap();
-        assert_eq!(f0.x, 2036);
-        // Next frame straight into zone 0: raw X = 0 + 255*0 = 0. Without
-        // unwrapping that would look like a -2036 jump; the decoder
-        // recognises the wrap and lifts X to 2040 (continuous extension).
-        let f1 = d.parse(&touch_packet(1, 0x00, 0x00, 0xE6)).unwrap().points[0].unwrap();
-        assert_eq!(f1.x, TOUCH_X_PERIOD);
-        // Continuing forward through zone 0 keeps the offset.
-        let f2 = d.parse(&touch_packet(2, 0x10, 0x00, 0xE6)).unwrap().points[0].unwrap();
-        assert_eq!(f2.x, TOUCH_X_PERIOD + 0x10);
+        let f0 = d.parse(&touch_packet(0, 0xFC, 0xEF, 0xE6)).unwrap().points[0].unwrap();
+        assert_eq!(f0.x, 0xFC + 255 * 7);
+        let f1 = d.parse(&touch_packet(1, 0x25, 0xF0, 0xE6)).unwrap().points[0].unwrap();
+        assert_eq!(f1.x, 0x25, "raw X stays in [0, TOUCH_X_PERIOD) after the wrap");
     }
 
     #[test]
-    fn touch_decoder_unwraps_backward_across_zone_boundary() {
-        let mut d = TouchDecoder::new();
-        // Sliding right-to-left across the zone-0 boundary: 0 → 2023.
-        let f0 = d.parse(&touch_packet(0, 0x00, 0x00, 0xE6)).unwrap().points[0].unwrap();
-        assert_eq!(f0.x, 0);
-        let f1 = d.parse(&touch_packet(1, 0xEE, 0x07, 0xE6)).unwrap().points[0].unwrap();
-        // Raw 2023, but the +2023 jump is interpreted as a backward wrap,
-        // so the extended X drops to 2023 - 2040 = -17.
-        assert_eq!(f1.x, 0xEE + 255 * 7 - TOUCH_X_PERIOD);
+    fn touch_decoder_x_is_history_independent() {
+        // Real-world failure mode: touchdown on the far right of the
+        // pad (zone 0/1 area) then swiping left through the wrap point
+        // used to produce X values shifted by `-TOUCH_X_PERIOD` from
+        // those a left-start swipe reported at the same physical
+        // location. With raw cyclic X the same (b0, b1) decodes to the
+        // same X regardless of preceding frames.
+        let mut left_start = TouchDecoder::new();
+        // L→R swipe: zone 1 (right edge) → zone 0 → wrap → zone 7 (just
+        // past centre).
+        left_start.parse(&touch_packet(0, 0x28, 0xA1, 0xE6)).unwrap();
+        left_start.parse(&touch_packet(1, 0x0A, 0x90, 0xE6)).unwrap();
+        let from_left = left_start
+            .parse(&touch_packet(2, 0xF9, 0x9F, 0xE6))
+            .unwrap()
+            .points[0]
+            .unwrap();
+
+        let mut fresh = TouchDecoder::new();
+        let from_fresh = fresh
+            .parse(&touch_packet(0, 0xF9, 0x9F, 0xE6))
+            .unwrap()
+            .points[0]
+            .unwrap();
+
+        assert_eq!(from_left.x, from_fresh.x);
+        assert_eq!(from_left.x, 0xF9 + 255 * 7);
     }
 
     #[test]
-    fn touch_decoder_resets_offset_on_release() {
+    fn touch_decoder_release_then_touch_preserves_x() {
+        // Stateless decoder: lifting the finger and putting it back
+        // down on the same bytes yields the same X.
         let mut d = TouchDecoder::new();
-        // Build up a non-zero offset by wrapping forward once.
-        d.parse(&touch_packet(0, 0xFB, 0x07, 0xE6)).unwrap();
-        let wrapped = d.parse(&touch_packet(1, 0x00, 0x00, 0xE6)).unwrap().points[0].unwrap();
-        assert_eq!(wrapped.x, TOUCH_X_PERIOD);
-        // Release.
-        let release = d.parse(&release_packet(2)).unwrap();
-        assert_eq!(release.finger_count(), 0);
-        // Next contact starts with no carry-over offset.
-        let fresh = d.parse(&touch_packet(3, 0x32, 0x02, 0xE6)).unwrap().points[0].unwrap();
-        assert_eq!(fresh.x, 0x32 + 255 * 2);
-    }
-
-    #[test]
-    fn touch_decoder_does_not_wrap_on_small_motion() {
-        let mut d = TouchDecoder::new();
-        // Zone 4 → still zone 4, small forward step. No wrap.
-        let f0 = d.parse(&touch_packet(0, 0x80, 0x04, 0xE6)).unwrap().points[0].unwrap();
-        let f1 = d.parse(&touch_packet(1, 0x90, 0x04, 0xE6)).unwrap().points[0].unwrap();
-        assert_eq!(f0.x, 0x80 + 255 * 4);
-        assert_eq!(f1.x, 0x90 + 255 * 4);
+        let first = d.parse(&touch_packet(0, 0x32, 0x02, 0xE6)).unwrap().points[0].unwrap();
+        d.parse(&release_packet(1)).unwrap();
+        let again = d.parse(&touch_packet(2, 0x32, 0x02, 0xE6)).unwrap().points[0].unwrap();
+        assert_eq!(first.x, again.x);
     }
 }
