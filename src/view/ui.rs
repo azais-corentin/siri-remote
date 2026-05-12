@@ -318,33 +318,63 @@ fn draw_trail(ctx: &mut Context<'_>, trail: &std::collections::VecDeque<TrailPoi
     }
 }
 
-/// While calibrating, project the running min/max rectangle from firmware
-/// coordinates onto the touchpad disc so the user can see what their
-/// current swing covers. Idle mode is a no-op.
+/// While calibrating, draw a yellow rectangle over the touchpad disc
+/// showing how much of the pad the running session has covered:
+/// X spans the inferred pad arc (from `derive_x_arc`), Y the running
+/// `[y_min, y_max]`. Projection uses the default calibration so the
+/// overlay aligns with the trail (which is also rendered via the
+/// default mapping during calibration).
 fn draw_calibration_overlay(ctx: &mut Context<'_>, state: &AppState) {
+    use crate::decoder::{FingerData, TOUCH_X_PERIOD};
+    use crate::view::state::{Calibration, normalize_finger};
+
     let Some(session) = state.calibration_session() else {
         return;
     };
-    if session.samples == 0 {
+    let Some((x_origin, x_span)) = session.derive_x_arc() else {
+        return;
+    };
+    if x_span < 2 || session.y_max <= session.y_min {
         return;
     }
-    use crate::decoder::TOUCH_X_PERIOD;
+
     let center_x = 50.0_f64;
     let center_y = 230.0_f64;
     let radius = 30.0_f64;
-    // Map firmware-default normalized coordinates onto the canvas disc.
-    let project_x = |fx: i32| -> f64 {
-        let n = fx as f64 / TOUCH_X_PERIOD as f64;
-        center_x + (n - 0.5) * 2.0 * radius
+    let default_cal = Calibration::default();
+
+    let project = |encoded_x: i32, y: i16| -> Option<(f64, f64)> {
+        let f = FingerData {
+            x: encoded_x,
+            y,
+            pressure: 0x20,
+            status: 0,
+            aux: [0, 0],
+            byte1_high: 0,
+        };
+        normalize_finger(&f, &default_cal).map(|(nx, ny)| {
+            (
+                center_x + (nx - 0.5) * 2.0 * radius,
+                center_y + (ny - 0.5) * 2.0 * radius,
+            )
+        })
     };
-    let project_y = |fy: i32| -> f64 {
-        let n = fy as f64 / 106.0;
-        center_y + (n - 0.5) * 2.0 * radius
+
+    let right_x = (x_origin + x_span - 1).rem_euclid(TOUCH_X_PERIOD);
+    let (Some((x_left, y_top)), Some((x_right, y_bot))) = (
+        project(x_origin, session.y_min as i16),
+        project(right_x, session.y_max as i16),
+    ) else {
+        return;
     };
-    let x = project_x(session.x_min);
-    let y = project_y(session.y_min);
-    let width = project_x(session.x_max) - x;
-    let height = project_y(session.y_max) - y;
+
+    let x = x_left.min(x_right);
+    let y = y_top.min(y_bot);
+    let width = (x_right - x_left).abs();
+    let height = (y_bot - y_top).abs();
+    if width < 0.5 || height < 0.5 {
+        return;
+    }
     ctx.draw(&Rectangle {
         x,
         y,
@@ -690,7 +720,7 @@ fn draw_calibration_readout(
     frame: &mut Frame<'_>,
     area: Rect,
     state: &AppState,
-    session: crate::view::state::CalibrationSession,
+    session: &crate::view::state::CalibrationSession,
 ) {
     let block = Block::default()
         .borders(Borders::ALL)
@@ -704,11 +734,12 @@ fn draw_calibration_readout(
     frame.render_widget(block, area);
 
     let saved = state.calibration;
-    let (x_range, y_range, samples) = if session.samples == 0 {
-        ("[--..--]".to_string(), "[--..--]".to_string(), 0usize)
+    let (x_summary, y_range, samples) = if session.samples == 0 {
+        ("origin=-- span=--".to_string(), "[--..--]".to_string(), 0usize)
     } else {
+        let (origin, span) = session.derive_x_arc().unwrap_or((0, 0));
         (
-            format!("[{}..{}]", session.x_min, session.x_max),
+            format!("origin={origin} span={span}"),
             format!("[{}..{}]", session.y_min, session.y_max),
             session.samples,
         )
@@ -719,10 +750,10 @@ fn draw_calibration_readout(
             Style::default().fg(Color::Yellow),
         )),
         Line::from("press c to finish · Esc to cancel"),
-        Line::from(format!("x: {x_range}  y: {y_range}  samples={samples}")),
+        Line::from(format!("x: {x_summary}  y: {y_range}  samples={samples}")),
         Line::from(format!(
-            "saved: x=[{}..{}] y=[{}..{}]",
-            saved.x_min, saved.x_max, saved.y_min, saved.y_max,
+            "saved: x_origin={} x_span={} y=[{}..{}]",
+            saved.x_origin, saved.x_span, saved.y_min, saved.y_max,
         )),
     ];
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);

@@ -71,15 +71,25 @@ pub struct TrailPoint {
     pub stamp: Instant,
 }
 
-/// Per-axis min/max in raw firmware coordinates. `x` is the decoder's
-/// extended monotonic position (continuous across the firmware's cyclic
-/// 11-bit wrap); `y` is the firmware byte (nominally `0..=106`). Default
-/// matches the historical hard-coded behavior, so an uncalibrated state
-/// renders identically to the pre-calibration code.
+/// Touchpad-to-canvas mapping.
+///
+/// X is **cyclic**: the firmware's encoded X is an 11-bit value in
+/// `0..TOUCH_X_PERIOD` whose wrap point falls inside the physical pad.
+/// We model the pad as an arc on that cycle: `x_origin` is the encoded
+/// X at the **left edge**, `x_span` is the cyclic distance clockwise to
+/// the right edge (always `< TOUCH_X_PERIOD`).
+///
+/// Y is a linear `[y_min, y_max]` window over the firmware byte
+/// (nominally `0..=106`).
+///
+/// Defaults are calibrated against the gen-3 DNDJ22MG2330 captures in
+/// the repository; per-device variance is small enough that the
+/// out-of-the-box mapping is usable without calibration, but a saved
+/// calibration tightens both axes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Calibration {
-    pub x_min: i32,
-    pub x_max: i32,
+    pub x_origin: i32,
+    pub x_span: i32,
     pub y_min: i32,
     pub y_max: i32,
 }
@@ -87,19 +97,26 @@ pub struct Calibration {
 impl Default for Calibration {
     fn default() -> Self {
         Self {
-            x_min: 0,
-            x_max: TOUCH_X_PERIOD,
+            // Empirically derived from the swipe captures: left edge
+            // ≈ encoded 1040, right edge ≈ encoded 300, so the pad
+            // covers a 1300-unit arc starting at 1040.
+            x_origin: 1040,
+            x_span: 1300,
             y_min: 0,
             y_max: 106,
         }
     }
 }
 
-/// Running min/max plus a sample counter for an in-progress calibration.
-#[derive(Clone, Copy, Debug)]
+/// Running bounds for an in-progress calibration session.
+///
+/// X collection keeps every distinct encoded value observed; on
+/// [`Self::derive_x_arc`] we identify the **longest unsampled arc** on
+/// the cycle as the "off-pad" region, and report the complementary arc
+/// (its end as `x_origin`, the period minus the gap as `x_span`).
+#[derive(Clone, Debug)]
 pub struct CalibrationSession {
-    pub x_min: i32,
-    pub x_max: i32,
+    pub x_samples: Vec<i32>,
     pub y_min: i32,
     pub y_max: i32,
     pub samples: usize,
@@ -108,8 +125,7 @@ pub struct CalibrationSession {
 impl CalibrationSession {
     fn new() -> Self {
         Self {
-            x_min: i32::MAX,
-            x_max: i32::MIN,
+            x_samples: Vec::new(),
             y_min: i32::MAX,
             y_max: i32::MIN,
             samples: 0,
@@ -119,12 +135,7 @@ impl CalibrationSession {
     /// Fold one finger sample into the running bounds. `raw_x` is the
     /// firmware cyclic value, `raw_y` the firmware byte.
     pub fn observe(&mut self, raw_x: i32, raw_y: i32) {
-        if raw_x < self.x_min {
-            self.x_min = raw_x;
-        }
-        if raw_x > self.x_max {
-            self.x_max = raw_x;
-        }
+        self.x_samples.push(raw_x);
         if raw_y < self.y_min {
             self.y_min = raw_y;
         }
@@ -134,18 +145,49 @@ impl CalibrationSession {
         self.samples += 1;
     }
 
+    /// Infer `(x_origin, x_span)` from the collected X samples. Finds
+    /// the largest cyclic gap between consecutive distinct samples;
+    /// the sample immediately after that gap is the left edge, and
+    /// the gap's complement is the pad span. Returns `None` when no
+    /// samples have been recorded yet.
+    pub fn derive_x_arc(&self) -> Option<(i32, i32)> {
+        if self.x_samples.is_empty() {
+            return None;
+        }
+        let mut sorted: Vec<i32> = self.x_samples.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        if sorted.len() == 1 {
+            return Some((sorted[0], 0));
+        }
+        let n = sorted.len();
+        let mut max_gap = 0;
+        let mut gap_end = 0usize;
+        for i in 0..n {
+            let cur = sorted[i];
+            let next = sorted[(i + 1) % n];
+            let gap = (next - cur).rem_euclid(TOUCH_X_PERIOD);
+            if gap > max_gap {
+                max_gap = gap;
+                gap_end = (i + 1) % n;
+            }
+        }
+        Some((sorted[gap_end], TOUCH_X_PERIOD - max_gap))
+    }
+
     /// `true` iff the running bounds clear both the sample and span
     /// thresholds. Used by [`AppState::finish_calibration`] to decide
     /// commit vs. reject.
     pub fn is_acceptable(&self) -> bool {
+        let x_span = self.derive_x_arc().map(|(_, s)| s).unwrap_or(0);
         self.samples >= MIN_CALIBRATION_SAMPLES
-            && self.x_max - self.x_min >= MIN_CALIBRATION_X_SPAN
+            && x_span >= MIN_CALIBRATION_X_SPAN
             && self.y_max - self.y_min >= MIN_CALIBRATION_Y_SPAN
     }
 }
 
 /// Calibration state machine carried by [`AppState`].
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub enum CalibrationMode {
     Idle,
     Active(CalibrationSession),
@@ -229,23 +271,24 @@ impl AppState {
     /// [`FinishOutcome::Committed`] carries the new bounds; otherwise the
     /// previous calibration is retained and the outcome is `Rejected`.
     pub fn finish_calibration(&mut self) -> FinishOutcome {
-        let session = match self.calibration_mode {
+        let session = match std::mem::replace(&mut self.calibration_mode, CalibrationMode::Idle) {
             CalibrationMode::Active(s) => s,
             CalibrationMode::Idle => return FinishOutcome::Rejected,
         };
-        self.calibration_mode = CalibrationMode::Idle;
         self.touch_trail.clear();
-        if session.is_acceptable() {
-            self.calibration = Calibration {
-                x_min: session.x_min,
-                x_max: session.x_max,
-                y_min: session.y_min,
-                y_max: session.y_max,
-            };
-            FinishOutcome::Committed
-        } else {
-            FinishOutcome::Rejected
+        if !session.is_acceptable() {
+            return FinishOutcome::Rejected;
         }
+        let (x_origin, x_span) = session
+            .derive_x_arc()
+            .expect("acceptable session must have ≥1 sample");
+        self.calibration = Calibration {
+            x_origin,
+            x_span,
+            y_min: session.y_min,
+            y_max: session.y_max,
+        };
+        FinishOutcome::Committed
     }
 
     /// Abort the current session and keep the previous calibration.
@@ -263,8 +306,8 @@ impl AppState {
     }
 
     /// Snapshot of the running session, for the live readout panel.
-    pub fn calibration_session(&self) -> Option<CalibrationSession> {
-        match self.calibration_mode {
+    pub fn calibration_session(&self) -> Option<&CalibrationSession> {
+        match &self.calibration_mode {
             CalibrationMode::Active(s) => Some(s),
             CalibrationMode::Idle => None,
         }
@@ -326,8 +369,8 @@ impl AppState {
                     // the running bounds, but use the *default* mapping
                     // for the trail so the user can see where they are
                     // physically drawing.
-                    let mode = self.calibration_mode;
-                    let cal_for_trail = if matches!(mode, CalibrationMode::Active(_)) {
+                    let calibrating = self.is_calibrating();
+                    let cal_for_trail = if calibrating {
                         Calibration::default()
                     } else {
                         self.calibration
@@ -335,8 +378,7 @@ impl AppState {
                     for (idx, slot) in event.points.iter().enumerate() {
                         if let Some(f) = slot {
                             if let CalibrationMode::Active(ref mut s) = self.calibration_mode {
-                                let raw_x = f.x;
-                                s.observe(raw_x, f.y as i32);
+                                s.observe(f.x, f.y as i32);
                             }
                             if let Some((nx, ny)) = normalize_finger(f, &cal_for_trail) {
                                 if self.touch_trail.len() == TRAIL_CAP {
@@ -405,24 +447,32 @@ pub fn power_label(state: PowerState) -> &'static str {
     }
 }
 
-/// Normalize a raw [`FingerData`] sample into canvas-local coordinates
-/// using `cal`. X is mapped from the cyclic firmware value through
-/// `[cal.x_min..cal.x_max]`; Y is mapped from the firmware byte through
-/// `[cal.y_min..cal.y_max]`. Both axes are clamped to `[-0.1, 1.1]` so
-/// edge taps remain visible without painting deep into the bezel.
+/// Normalize a raw [`FingerData`] sample into canvas-local coordinates.
 ///
-/// Returns `None` only if the calibration is degenerate
-/// (`x_min == x_max` or `y_min == y_max`); production code constructs
-/// these from valid sessions or `Calibration::default()`, so the `None`
-/// branch is just a hard safety guard against divide-by-zero.
+/// X uses the signed shortest cyclic delta from the pad's centre
+/// (`cal.x_origin + cal.x_span/2`), divided by the span and shifted to
+/// `[0, 1]`. Off-pad positions on either side of the wrap produce
+/// values outside `[0, 1]`, which are clamped to `[-0.1, 1.1]` so the
+/// renderer still draws something at edge taps without painting
+/// arbitrarily far into the bezel.
+///
+/// Y is the linear `[y_min, y_max]` mapping over the firmware byte.
+///
+/// Returns `None` only if calibration is degenerate (`x_span <= 0` or
+/// `y_min == y_max`).
 pub fn normalize_finger(f: &FingerData, cal: &Calibration) -> Option<(f64, f64)> {
-    let x_span = cal.x_max - cal.x_min;
     let y_span = cal.y_max - cal.y_min;
-    if x_span == 0 || y_span == 0 {
+    if cal.x_span <= 0 || y_span == 0 {
         return None;
     }
-    let raw_x = f.x;
-    let nx = (raw_x - cal.x_min) as f64 / x_span as f64;
+    let half_period = TOUCH_X_PERIOD / 2;
+    let centre = cal.x_origin + cal.x_span / 2;
+    // Signed shortest cyclic delta from the pad's centre, in
+    // `(-TOUCH_X_PERIOD/2, TOUCH_X_PERIOD/2]`. The `+ half_period`
+    // before `rem_euclid` and the `- half_period` after fold the
+    // wrap into a signed quantity centred on 0.
+    let d = (f.x - centre + half_period).rem_euclid(TOUCH_X_PERIOD) - half_period;
+    let nx = d as f64 / cal.x_span as f64 + 0.5;
     let ny = (f.y as i32 - cal.y_min) as f64 / y_span as f64;
     Some((nx.clamp(-0.1, 1.1), ny.clamp(-0.1, 1.1)))
 }
@@ -476,49 +526,79 @@ mod tests {
     }
 
     #[test]
-    fn calibration_default_matches_pre_calibration_bounds() {
+    fn calibration_default_maps_pad_centre_to_canvas_centre() {
         let cal = Calibration::default();
-        // Centre of nominal touchpad → centre of canvas.
-        let (nx, ny) = normalize_finger(&finger(TOUCH_X_PERIOD / 2, 53), &cal).unwrap();
-        assert!((nx - 0.5).abs() < 1e-9);
-        assert!((ny - (53.0 / 106.0)).abs() < 1e-9);
+        // Encoded X 1690 is exactly the centre of the default pad arc
+        // (origin 1040 + span/2 = 650).
+        let (nx, ny) = normalize_finger(&finger(1690, 53), &cal).unwrap();
+        assert!((nx - 0.5).abs() < 1e-9, "nx={nx}");
+        assert!((ny - (53.0 / 106.0)).abs() < 1e-9, "ny={ny}");
     }
 
     #[test]
-    fn normalize_finger_uses_calibration_extremes() {
-        let cal = Calibration { x_min: 100, x_max: 1900, y_min: 10, y_max: 90 };
-        let (lo_x, lo_y) = normalize_finger(&finger(100, 10), &cal).unwrap();
-        let (hi_x, hi_y) = normalize_finger(&finger(1900, 90), &cal).unwrap();
-        assert!((lo_x - 0.0).abs() < 1e-9, "lo_x={lo_x}");
-        assert!((lo_y - 0.0).abs() < 1e-9, "lo_y={lo_y}");
-        assert!((hi_x - 1.0).abs() < 1e-9, "hi_x={hi_x}");
-        assert!((hi_y - 1.0).abs() < 1e-9, "hi_y={hi_y}");
+    fn calibration_default_maps_pad_edges_to_canvas_edges() {
+        let cal = Calibration::default();
+        // Left edge (encoded 1040): nx ≈ 0.
+        let (nx_l, _) = normalize_finger(&finger(1040, 53), &cal).unwrap();
+        assert!(nx_l.abs() < 1e-9, "nx_l={nx_l}");
+        // Right edge (encoded 1040 + 1300 = 2340 mod 2040 = 300): nx ≈ 1.
+        let (nx_r, _) = normalize_finger(&finger(300, 53), &cal).unwrap();
+        assert!((nx_r - 1.0).abs() < 1e-9, "nx_r={nx_r}");
     }
 
     #[test]
-    fn normalize_finger_clamps_out_of_range_samples() {
-        // Narrow bounds so a 0 sample falls well below -0.1.
-        let cal = Calibration { x_min: 1000, x_max: 1100, y_min: 50, y_max: 60 };
-        let (nx, ny) = normalize_finger(&finger(0, 0), &cal).unwrap();
-        assert!((nx + 0.1).abs() < 1e-9, "nx={nx}");
-        assert!((ny + 0.1).abs() < 1e-9, "ny={ny}");
-        // Way above x_max / y_max — should clamp to 1.1.
-        let (nx, ny) = normalize_finger(&finger(TOUCH_X_PERIOD - 1, 100), &cal).unwrap();
+    fn normalize_finger_is_history_independent_across_the_wrap() {
+        // Centre, slightly-left-of-centre, slightly-right-of-centre all
+        // produce stable nx regardless of where the user touched down.
+        let cal = Calibration::default();
+        let centre_a = normalize_finger(&finger(1690, 53), &cal).unwrap().0;
+        let centre_b = normalize_finger(&finger(1690, 53), &cal).unwrap().0;
+        assert!((centre_a - centre_b).abs() < 1e-9);
+
+        // Encoded values straddling the 2040↔0 wrap map continuously.
+        let near_wrap_pre = normalize_finger(&finger(2039, 53), &cal).unwrap().0;
+        let near_wrap_post = normalize_finger(&finger(0, 53), &cal).unwrap().0;
+        assert!(
+            (near_wrap_pre - near_wrap_post).abs() < 2.0 / cal.x_span as f64,
+            "expected continuity across the wrap, got {near_wrap_pre} vs {near_wrap_post}",
+        );
+    }
+
+    #[test]
+    fn normalize_finger_uses_custom_origin_and_span() {
+        // Custom pad covering encoded [200..1800]: centre at 1000.
+        let cal = Calibration { x_origin: 200, x_span: 1600, y_min: 10, y_max: 90 };
+        let (left, _) = normalize_finger(&finger(200, 10), &cal).unwrap();
+        let (centre, _) = normalize_finger(&finger(1000, 50), &cal).unwrap();
+        let (right, _) = normalize_finger(&finger(1800, 90), &cal).unwrap();
+        assert!(left.abs() < 1e-9, "left={left}");
+        assert!((centre - 0.5).abs() < 1e-9, "centre={centre}");
+        assert!((right - 1.0).abs() < 1e-9, "right={right}");
+    }
+
+    #[test]
+    fn normalize_finger_clamps_off_pad_samples() {
+        // Narrow pad arc; samples in the off-pad region get clamped.
+        let cal = Calibration { x_origin: 1000, x_span: 100, y_min: 50, y_max: 60 };
+        // Encoded X = 1050 sits at the pad centre → nx = 0.5.
+        let (nx, ny) = normalize_finger(&finger(1050, 55), &cal).unwrap();
+        assert!((nx - 0.5).abs() < 1e-9, "nx={nx}");
+        assert!((ny - 0.5).abs() < 1e-9, "ny={ny}");
+        // Encoded X = 0 is far off-pad → clamps. With centre=1050 and
+        // period 2040, the shortest cyclic delta from 1050 to 0 is 990
+        // units *clockwise* (forward), so 0 sits on the "past the right
+        // edge" side and nx clamps to 1.1.
+        let (nx, _) = normalize_finger(&finger(0, 55), &cal).unwrap();
         assert!((nx - 1.1).abs() < 1e-9, "nx={nx}");
-        assert!((ny - 1.1).abs() < 1e-9, "ny={ny}");
-    }
-
-    #[test]
-    fn normalize_finger_does_not_wrap_at_period_boundary() {
-        // f.x == TOUCH_X_PERIOD used to fold to the left edge via rem_euclid.
-        let cal = Calibration::default();
-        let (nx, _) = normalize_finger(&finger(TOUCH_X_PERIOD, 53), &cal).unwrap();
-        assert!((nx - 1.0).abs() < 1e-9, "nx={nx}");
+        // Encoded X = 200 is 850 units counter-clockwise from centre,
+        // i.e. past the left edge → nx clamps to -0.1.
+        let (nx, _) = normalize_finger(&finger(200, 55), &cal).unwrap();
+        assert!((nx + 0.1).abs() < 1e-9, "nx={nx}");
     }
 
     #[test]
     fn normalize_finger_returns_none_for_degenerate_bounds() {
-        let cal = Calibration { x_min: 0, x_max: 0, y_min: 0, y_max: 106 };
+        let cal = Calibration { x_origin: 0, x_span: 0, y_min: 0, y_max: 106 };
         assert!(normalize_finger(&finger(0, 0), &cal).is_none());
     }
 
@@ -526,7 +606,7 @@ mod tests {
     fn start_calibration_clears_trail_and_marks_active() {
         let mut s = state();
         // Seed a trail point.
-        dispatch(&mut s, finger(500, 50));
+        dispatch(&mut s, finger(1500, 50));
         assert!(!s.touch_trail.is_empty());
         s.start_calibration();
         assert!(s.touch_trail.is_empty());
@@ -534,7 +614,7 @@ mod tests {
     }
 
     #[test]
-    fn touch_during_calibration_grows_running_bounds() {
+    fn touch_during_calibration_records_samples() {
         let mut s = state();
         s.start_calibration();
         dispatch(&mut s, finger(200, 20));
@@ -542,10 +622,35 @@ mod tests {
         dispatch(&mut s, finger(1000, 55));
         let session = s.calibration_session().expect("session active");
         assert_eq!(session.samples, 3);
-        assert_eq!(session.x_min, 200);
-        assert_eq!(session.x_max, 1800);
+        assert_eq!(session.x_samples, vec![200, 1800, 1000]);
         assert_eq!(session.y_min, 20);
         assert_eq!(session.y_max, 90);
+    }
+
+    #[test]
+    fn derive_x_arc_finds_longest_unsampled_gap() {
+        let mut s = CalibrationSession::new();
+        // Samples concentrated in the encoded range [1000..1500], leaving
+        // [1500..1000+TOUCH_X_PERIOD] = 1540 units unsampled.
+        for x in [1000, 1100, 1200, 1300, 1400, 1500] {
+            s.observe(x, 50);
+        }
+        let (origin, span) = s.derive_x_arc().expect("samples present");
+        assert_eq!(origin, 1000, "origin = sample immediately after the gap");
+        assert_eq!(span, 1500 - 1000, "span = period − longest gap");
+    }
+
+    #[test]
+    fn derive_x_arc_handles_samples_straddling_the_wrap() {
+        let mut s = CalibrationSession::new();
+        // Samples near the wrap on both sides: 1900, 2000, 100, 200.
+        // Longest gap is between 200 and 1900 = 1700.
+        for x in [1900, 2000, 100, 200] {
+            s.observe(x, 50);
+        }
+        let (origin, span) = s.derive_x_arc().expect("samples present");
+        assert_eq!(origin, 1900, "origin sits right after the longest gap");
+        assert_eq!(span, TOUCH_X_PERIOD - 1700);
     }
 
     #[test]
@@ -553,6 +658,9 @@ mod tests {
         let mut s = state();
         s.start_calibration();
         // Spread along both axes, more than MIN_CALIBRATION_SAMPLES frames.
+        // Samples sweep the encoded range [200..1900], so the longest gap
+        // is between 1900 and 200 (cyclic) = 2040 − 1700 = 340 units, and
+        // the inferred pad span is 1700.
         for i in 0..MIN_CALIBRATION_SAMPLES {
             let frac = i as f64 / (MIN_CALIBRATION_SAMPLES - 1) as f64;
             let x = (200.0 + frac * 1700.0) as i32;
@@ -562,8 +670,8 @@ mod tests {
         let outcome = s.finish_calibration();
         assert_eq!(outcome, FinishOutcome::Committed);
         assert!(!s.is_calibrating());
-        assert_eq!(s.calibration.x_min, 200);
-        assert_eq!(s.calibration.x_max, 1900);
+        assert_eq!(s.calibration.x_origin, 200);
+        assert_eq!(s.calibration.x_span, 1700);
         assert_eq!(s.calibration.y_min, 20);
         assert_eq!(s.calibration.y_max, 90);
     }
@@ -599,7 +707,7 @@ mod tests {
 
     #[test]
     fn cancel_calibration_restores_previous_and_clears_session() {
-        let prior = Calibration { x_min: 50, x_max: 1950, y_min: 5, y_max: 100 };
+        let prior = Calibration { x_origin: 50, x_span: 1900, y_min: 5, y_max: 100 };
         let mut s = AppState::new(selection(), prior);
         s.start_calibration();
         dispatch(&mut s, finger(500, 50));
@@ -611,7 +719,7 @@ mod tests {
 
     #[test]
     fn clear_calibration_resets_to_default() {
-        let prior = Calibration { x_min: 50, x_max: 1950, y_min: 5, y_max: 100 };
+        let prior = Calibration { x_origin: 50, x_span: 1900, y_min: 5, y_max: 100 };
         let mut s = AppState::new(selection(), prior);
         s.clear_calibration();
         assert_eq!(s.calibration, Calibration::default());

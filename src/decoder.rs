@@ -418,7 +418,10 @@ fn decode_slot_if_active(b: &[u8]) -> Option<FingerData> {
 fn decode_slot(b: &[u8]) -> FingerData {
     let zone = (b[1] & TOUCH_X_ZONE_MASK) as u16;
     debug_assert!(zone < TOUCH_X_ZONES as u16);
-    let x = b[0] as i32 + 255 * zone as i32;
+    // 8 zones × 255 = 2040 = TOUCH_X_PERIOD. b[0]=0xFF in zone 7 hits
+    // the period boundary; collapse it to 0 (cycle equivalence) so
+    // every value lives in `[0, TOUCH_X_PERIOD)`.
+    let x = (b[0] as i32 + 255 * zone as i32) % TOUCH_X_PERIOD;
     debug_assert!((0..TOUCH_X_PERIOD).contains(&x));
 
     // Y mirrors the SiriRemote-Linux Python decoder:
