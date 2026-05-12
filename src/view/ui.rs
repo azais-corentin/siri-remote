@@ -34,6 +34,12 @@ const TOUCH_ELLIPSE_AXIS_SCALE: f64 = 0.8 * 30.0 / 256.0;
 const MIN_COLS: u16 = 70;
 const MIN_ROWS: u16 = 24;
 
+/// Minimum width (in cells) for the remote column. Below this the silhouette
+/// degrades into an unreadable mess.
+const REMOTE_MIN_COLS: u16 = 18;
+/// Minimum width (in cells) reserved for the side panel.
+const PANEL_MIN_COLS: u16 = 40;
+
 // --- Public entry -----------------------------------------------------------
 
 pub fn draw(frame: &mut Frame<'_>, state: &AppState) {
@@ -49,9 +55,17 @@ pub fn draw(frame: &mut Frame<'_>, state: &AppState) {
         return;
     }
 
+    // Scale the remote column to keep the canvas's 1:3 (W:H) aspect.
+    // Braille marker dots are roughly square (2 dots/cell horizontal,
+    // 4 dots/cell vertical at ~1:2 cell aspect), so for an inner area of
+    // `cols × rows` cells the canvas reads as 1:3 when `rows == cols * 3/2`.
+    // Solving for cols given height H gives `cols = (H − 2) * 2 / 3 + 2`.
+    let desired_remote = area.height.saturating_sub(2) * 2 / 3 + 2;
+    let max_remote = area.width.saturating_sub(PANEL_MIN_COLS);
+    let remote_cols = desired_remote.clamp(REMOTE_MIN_COLS, max_remote.max(REMOTE_MIN_COLS));
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(28), Constraint::Min(40)])
+        .constraints([Constraint::Length(remote_cols), Constraint::Min(PANEL_MIN_COLS)])
         .split(area);
 
     draw_remote(frame, chunks[0], state);
@@ -80,13 +94,37 @@ fn draw_remote(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
+    // Inscribe the largest rect satisfying `rows == cols * 3/2` inside `inner`
+    // and center it. Without this, the clamps in `draw` (very tall narrow or
+    // very short wide terminals) would distort the silhouette.
+    let canvas_area = inscribe_remote_canvas(inner);
+
     let canvas = Canvas::default()
         .x_bounds([0.0, W])
         .y_bounds([0.0, H])
         .marker(Marker::Braille)
         .paint(move |ctx| paint_remote(ctx, state));
 
-    frame.render_widget(canvas, inner);
+    frame.render_widget(canvas, canvas_area);
+}
+
+/// Return the largest sub-rect of `inner` whose cell aspect renders the
+/// canvas's 1:3 (W:H) bounds without distortion, centered within `inner`.
+fn inscribe_remote_canvas(inner: Rect) -> Rect {
+    if inner.width == 0 || inner.height == 0 {
+        return inner;
+    }
+    // Want rows == cols * 3 / 2, bounded by inner.
+    let height_from_width = inner.width.saturating_mul(3) / 2;
+    let (cols, rows) = if height_from_width <= inner.height {
+        (inner.width, height_from_width)
+    } else {
+        let width_from_height = inner.height.saturating_mul(2) / 3;
+        (width_from_height, inner.height)
+    };
+    let x = inner.x + (inner.width.saturating_sub(cols)) / 2;
+    let y = inner.y + (inner.height.saturating_sub(rows)) / 2;
+    Rect::new(x, y, cols, rows)
 }
 
 fn paint_remote(ctx: &mut Context<'_>, state: &AppState) {
@@ -159,15 +197,15 @@ fn draw_power(ctx: &mut Context<'_>, state: &AppState, now: Instant) {
     ctx.draw(&Circle {
         x: cx,
         y: cy,
-        radius: 3.0,
+        radius: 6.0,
         color,
     });
     // ⏻ glyph: vertical bar through top.
     ctx.draw(&CanvasLine {
         x1: cx,
-        y1: cy + 2.0,
+        y1: cy + 3.0,
         x2: cx,
-        y2: cy + 5.0,
+        y2: cy + 9.0,
         color,
     });
 }
@@ -185,21 +223,21 @@ fn draw_siri_pill(ctx: &mut Context<'_>, state: &AppState, now: Instant) {
     ctx.draw(&Rectangle {
         x: 88.0,
         y: 170.0,
-        width: 4.0,
+        width: 2.0,
         height: 40.0,
         color,
     });
     // Round the ends.
     ctx.draw(&Circle {
-        x: 90.0,
+        x: 89.0,
         y: 170.0,
-        radius: 2.0,
+        radius: 1.0,
         color,
     });
     ctx.draw(&Circle {
-        x: 90.0,
+        x: 89.0,
         y: 210.0,
-        radius: 2.0,
+        radius: 1.0,
         color,
     });
 }
@@ -450,22 +488,22 @@ fn draw_back(ctx: &mut Context<'_>, state: &AppState, now: Instant) {
     ctx.draw(&Circle {
         x: cx,
         y: cy,
-        radius: 6.0,
+        radius: 13.5,
         color,
     });
     // ‹ glyph: two diagonal lines.
     ctx.draw(&CanvasLine {
-        x1: cx + 1.5,
-        y1: cy + 2.5,
-        x2: cx - 1.5,
+        x1: cx + 3.75,
+        y1: cy + 6.0,
+        x2: cx - 3.75,
         y2: cy,
         color,
     });
     ctx.draw(&CanvasLine {
-        x1: cx - 1.5,
+        x1: cx - 3.75,
         y1: cy,
-        x2: cx + 1.5,
-        y2: cy - 2.5,
+        x2: cx + 3.75,
+        y2: cy - 6.0,
         color,
     });
 }
@@ -477,15 +515,15 @@ fn draw_tv(ctx: &mut Context<'_>, state: &AppState, now: Instant) {
     ctx.draw(&Circle {
         x: cx,
         y: cy,
-        radius: 6.0,
+        radius: 13.5,
         color,
     });
     // ▢ glyph: small inner square.
     ctx.draw(&Rectangle {
-        x: cx - 2.5,
-        y: cy - 2.0,
-        width: 5.0,
-        height: 4.0,
+        x: cx - 6.0,
+        y: cy - 4.5,
+        width: 12.0,
+        height: 9.0,
         color,
     });
 }
@@ -497,22 +535,22 @@ fn draw_play_pause(ctx: &mut Context<'_>, state: &AppState, now: Instant) {
     ctx.draw(&Circle {
         x: cx,
         y: cy,
-        radius: 6.0,
+        radius: 13.5,
         color,
     });
     // ⏸ bars.
     ctx.draw(&CanvasLine {
-        x1: cx - 1.5,
-        y1: cy - 2.0,
-        x2: cx - 1.5,
-        y2: cy + 2.0,
+        x1: cx - 3.75,
+        y1: cy - 4.5,
+        x2: cx - 3.75,
+        y2: cy + 4.5,
         color,
     });
     ctx.draw(&CanvasLine {
-        x1: cx + 1.5,
-        y1: cy - 2.0,
-        x2: cx + 1.5,
-        y2: cy + 2.0,
+        x1: cx + 3.75,
+        y1: cy - 4.5,
+        x2: cx + 3.75,
+        y2: cy + 4.5,
         color,
     });
 }
@@ -522,17 +560,17 @@ fn draw_volume(ctx: &mut Context<'_>, state: &AppState, now: Instant) {
     let dn = style_for_bit(state, 0x0004, now);
     // Upper half body (+ bit).
     ctx.draw(&Rectangle {
-        x: 64.0,
+        x: 56.5,
         y: 110.0,
-        width: 12.0,
+        width: 27.0,
         height: 30.0,
         color: up,
     });
     // Lower half body (− bit).
     ctx.draw(&Rectangle {
-        x: 64.0,
+        x: 56.5,
         y: 80.0,
-        width: 12.0,
+        width: 27.0,
         height: 30.0,
         color: dn,
     });
@@ -540,35 +578,35 @@ fn draw_volume(ctx: &mut Context<'_>, state: &AppState, now: Instant) {
     ctx.draw(&Circle {
         x: 70.0,
         y: 140.0,
-        radius: 6.0,
+        radius: 13.5,
         color: up,
     });
     ctx.draw(&Circle {
         x: 70.0,
         y: 80.0,
-        radius: 6.0,
+        radius: 13.5,
         color: dn,
     });
     // + glyph at (70, 125).
     ctx.draw(&CanvasLine {
-        x1: 67.0,
+        x1: 64.0,
         y1: 125.0,
-        x2: 73.0,
+        x2: 76.0,
         y2: 125.0,
         color: up,
     });
     ctx.draw(&CanvasLine {
         x1: 70.0,
-        y1: 122.0,
+        y1: 119.0,
         x2: 70.0,
-        y2: 128.0,
+        y2: 131.0,
         color: up,
     });
     // − glyph at (70, 95).
     ctx.draw(&CanvasLine {
-        x1: 67.0,
+        x1: 64.0,
         y1: 95.0,
-        x2: 73.0,
+        x2: 76.0,
         y2: 95.0,
         color: dn,
     });
@@ -581,22 +619,22 @@ fn draw_mute(ctx: &mut Context<'_>, state: &AppState, now: Instant) {
     ctx.draw(&Circle {
         x: cx,
         y: cy,
-        radius: 6.0,
+        radius: 13.5,
         color,
     });
     // Speaker triangle (approximated by a single line) + strike-through.
     ctx.draw(&CanvasLine {
-        x1: cx - 2.0,
+        x1: cx - 4.5,
         y1: cy,
-        x2: cx + 2.0,
-        y2: cy - 1.5,
+        x2: cx + 4.5,
+        y2: cy - 3.0,
         color,
     });
     ctx.draw(&CanvasLine {
-        x1: cx - 3.0,
-        y1: cy + 3.0,
-        x2: cx + 3.0,
-        y2: cy - 3.0,
+        x1: cx - 6.75,
+        y1: cy + 6.75,
+        x2: cx + 6.75,
+        y2: cy - 6.75,
         color,
     });
 }
