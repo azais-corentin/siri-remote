@@ -95,9 +95,9 @@ fn handle_key(state: &mut AppState, action: KeyAction) -> KeyOutcome {
                     FinishOutcome::Committed => {
                         let c = state.calibration;
                         log::info!(
-                            "calibration saved: x_origin={} x_span={} y=[{}..{}]",
-                            c.x_origin,
-                            c.x_span,
+                            "calibration saved: x=[{}..{}] y=[{}..{}]",
+                            c.x_min,
+                            c.x_max,
                             c.y_min,
                             c.y_max,
                         );

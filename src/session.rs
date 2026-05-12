@@ -692,8 +692,11 @@ mod tests {
     fn touch_decode_emits_touch_event() {
         let mut input = InputDecoder::new();
         let mut touch = TouchDecoder::new();
-        // 11-byte touchpad payload: marker + seq + finger_mask(slot1) + 7 finger bytes.
-        // X=128 (zone 0), Y byte 0xC0 (signed wrap path: 0xC0-188 = 4).
+        // 11-byte touchpad payload: marker + seq + header(slot1) + 7 finger bytes.
+        // d0=0x80, d1=0x00, d2=0xC0, d3=0x00, d4=0x00, d5=0x10, d6=0x05.
+        // x_u12 = 0x80 | ((0x00 & 0x0f) << 8) = 0x080 = 128 (sign bit clear).
+        // y_u12 = (0x00 >> 4) | (0xC0 << 4)  = 0xC00 → sign-ext → -1024.
+        // Pressure 0x10 is non-zero, so the slot is valid.
         let mut payload = vec![0x32, 0x00, 0x00, 0x01, 0x80, 0x00, 0xC0, 0x00, 0x00, 0x10, 0x05];
         // Sanity: 11 bytes.
         assert_eq!(payload.len(), 11);
@@ -709,8 +712,9 @@ mod tests {
                 assert_eq!(event.finger_count(), 1);
                 let f = event.points[0].expect("slot 1 finger present");
                 assert_eq!(f.x, 128);
+                assert_eq!(f.y, -1024);
                 assert_eq!(f.pressure, 0x10);
-                assert_eq!(f.status, 0x05);
+                assert_eq!(f.flags, 0x05);
             }
             _ => panic!("expected Touch"),
         }

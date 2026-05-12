@@ -141,7 +141,7 @@ mod tests {
     #[test]
     fn save_then_load_roundtrip() {
         let base = temp_base();
-        let c = Calibration { x_origin: 120, x_span: 1820, y_min: 8, y_max: 96 };
+        let c = Calibration { x_min: -1800, x_max: 1800, y_min: -500, y_max: 200 };
         save_in(&base, &c).unwrap();
         let loaded = load_in(&base).unwrap().expect("calibration present after save");
         assert_eq!(loaded, c);

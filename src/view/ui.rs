@@ -319,22 +319,22 @@ fn draw_trail(ctx: &mut Context<'_>, trail: &std::collections::VecDeque<TrailPoi
 }
 
 /// While calibrating, draw a yellow rectangle over the touchpad disc
-/// showing how much of the pad the running session has covered:
-/// X spans the inferred pad arc (from `derive_x_arc`), Y the running
-/// `[y_min, y_max]`. Projection uses the default calibration so the
+/// showing how much of the pad the running session has covered. Both
+/// axes are linear, so the rectangle spans the running `(x_min, x_max)`
+/// and `(y_min, y_max)`. Projection uses the default calibration so the
 /// overlay aligns with the trail (which is also rendered via the
 /// default mapping during calibration).
 fn draw_calibration_overlay(ctx: &mut Context<'_>, state: &AppState) {
-    use crate::decoder::{FingerData, TOUCH_X_PERIOD};
+    use crate::decoder::FingerData;
     use crate::view::state::{Calibration, normalize_finger};
 
     let Some(session) = state.calibration_session() else {
         return;
     };
-    let Some((x_origin, x_span)) = session.derive_x_arc() else {
-        return;
-    };
-    if x_span < 2 || session.y_max <= session.y_min {
+    if session.samples == 0
+        || session.x_max <= session.x_min
+        || session.y_max <= session.y_min
+    {
         return;
     }
 
@@ -343,14 +343,14 @@ fn draw_calibration_overlay(ctx: &mut Context<'_>, state: &AppState) {
     let radius = 30.0_f64;
     let default_cal = Calibration::default();
 
-    let project = |encoded_x: i32, y: i16| -> Option<(f64, f64)> {
+    let project = |x: i16, y: i16| -> Option<(f64, f64)> {
         let f = FingerData {
-            x: encoded_x,
+            x,
             y,
+            major: 0x20,
+            minor: 0x20,
             pressure: 0x20,
-            status: 0,
-            aux: [0, 0],
-            byte1_high: 0,
+            flags: 0,
         };
         normalize_finger(&f, &default_cal).map(|(nx, ny)| {
             (
@@ -360,10 +360,9 @@ fn draw_calibration_overlay(ctx: &mut Context<'_>, state: &AppState) {
         })
     };
 
-    let right_x = (x_origin + x_span - 1).rem_euclid(TOUCH_X_PERIOD);
-    let (Some((x_left, y_top)), Some((x_right, y_bot))) = (
-        project(x_origin, session.y_min as i16),
-        project(right_x, session.y_max as i16),
+    let (Some((x_left, y_bot)), Some((x_right, y_top))) = (
+        project(session.x_min as i16, session.y_min as i16),
+        project(session.x_max as i16, session.y_max as i16),
     ) else {
         return;
     };
@@ -691,22 +690,21 @@ fn draw_touch_readout(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
         Some(t) => {
             let fingers = t.finger_count();
             lines.push(Line::from(format!(
-                "touch: fingers={fingers} seq=0x{:04X} mask=0x{:02X}",
-                t.seq, t.finger_mask
+                "touch: fingers={fingers} seq=0x{:04X} header=0x{:02X}",
+                t.seq, t.header
             )));
             for (idx, slot) in t.points.iter().enumerate() {
                 if let Some(f) = slot {
                     lines.push(Line::from(format!(
-                        "  slot {}: x={} y={} pressure=0x{:02X} status=0x{:02X} \
-                         aux={:02X}{:02X} byte1_high=0x{:02X}",
+                        "  slot {}: x={} y={} pressure=0x{:02X} flags=0x{:02X} \
+                         major={} minor={}",
                         idx + 1,
                         f.x,
                         f.y,
                         f.pressure,
-                        f.status,
-                        f.aux[0],
-                        f.aux[1],
-                        f.byte1_high,
+                        f.flags,
+                        f.major,
+                        f.minor,
                     )));
                 }
             }
@@ -734,12 +732,15 @@ fn draw_calibration_readout(
     frame.render_widget(block, area);
 
     let saved = state.calibration;
-    let (x_summary, y_range, samples) = if session.samples == 0 {
-        ("origin=-- span=--".to_string(), "[--..--]".to_string(), 0usize)
-    } else {
-        let (origin, span) = session.derive_x_arc().unwrap_or((0, 0));
+    let (x_range, y_range, samples) = if session.samples == 0 {
         (
-            format!("origin={origin} span={span}"),
+            "[--..--]".to_string(),
+            "[--..--]".to_string(),
+            0usize,
+        )
+    } else {
+        (
+            format!("[{}..{}]", session.x_min, session.x_max),
             format!("[{}..{}]", session.y_min, session.y_max),
             session.samples,
         )
@@ -750,10 +751,10 @@ fn draw_calibration_readout(
             Style::default().fg(Color::Yellow),
         )),
         Line::from("press c to finish · Esc to cancel"),
-        Line::from(format!("x: {x_summary}  y: {y_range}  samples={samples}")),
+        Line::from(format!("x: {x_range}  y: {y_range}  samples={samples}")),
         Line::from(format!(
-            "saved: x_origin={} x_span={} y=[{}..{}]",
-            saved.x_origin, saved.x_span, saved.y_min, saved.y_max,
+            "saved: x=[{}..{}] y=[{}..{}]",
+            saved.x_min, saved.x_max, saved.y_min, saved.y_max,
         )),
     ];
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
