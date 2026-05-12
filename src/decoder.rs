@@ -21,21 +21,21 @@ pub const APPLE_HID_MFR_PREFIX: [u8; 2] = [0x07, 0x0D];
 /// 16-bit button mask → display name for the gen-3 Siri Remote (model
 /// DNDJ22MG2330). Bits 0..7 come from byte 0 of the 2-byte HID Input report
 /// 0xFB (system buttons), bits 8..15 from byte 1 (clickpad directional
-/// clicks + Play/Pause). Empirically mapped — Apple does not publish the
-/// report layout. Bits not listed have not been observed during testing
-/// and decode to nothing.
+/// clicks + Play/Pause). Empirically mapped against the physical remote —
+/// Apple does not publish the report layout. Bits not listed have not been
+/// observed during testing and decode to nothing.
 ///
 /// The gen-1 / gen-2 remotes use a different (single-byte) layout; that
 /// firmware variant is out of scope for this decoder.
 pub const BUTTON_NAMES: &[(u16, &str)] = &[
-    (0x0001, "Select"),
+    (0x0001, "TV"),
     (0x0002, "Volume Up"),
     (0x0004, "Volume Down"),
-    (0x0008, "Mute"),
+    (0x0008, "Select"),
     (0x0010, "Power"),
     (0x0020, "Siri"),
     (0x0040, "Back"),
-    (0x0080, "TV"),
+    (0x0080, "Mute"),
     (0x0100, "Play/Pause"),
     (0x0200, "Up"),
     (0x0400, "Down"),
@@ -167,6 +167,157 @@ impl InputDecoder {
     }
 }
 
+// -- Touchpad input decoding --------------------------------------------------
+
+/// Marker byte that prefixes every touchpad HID Input report on report id
+/// 0xFC. Empirically constant; matches the gen-1 / gen-2 `TOUCH_EVENT`
+/// sentinel from the SiriRemote-Linux Python reference (`0x32 == 50`).
+pub const TOUCH_MARKER: u8 = 0x32;
+
+/// Wire length of a single-finger touchpad report on the gen-3 Siri Remote
+/// (model DNDJ22MG2330). The report uses report id 0xFC; payload is fixed
+/// at 11 bytes whether a finger is in contact or the surface is idle.
+pub const TOUCH_REPORT_LEN_1F: usize = 11;
+
+/// Wire length of a two-finger touchpad report. The first 11 bytes are
+/// identical to the single-finger layout (slot 1); the trailing 7 bytes
+/// repeat the slot-1 trailer (`motion` + `x` + `y` + `pressure` + `status`)
+/// for slot 2.
+pub const TOUCH_REPORT_LEN_2F: usize = 18;
+
+/// Bit in byte 3 set when slot 1 (primary finger) is in contact.
+pub const FINGER_SLOT_1_MASK: u8 = 0x01;
+/// Bit in byte 3 set when slot 2 (secondary finger) is in contact.
+/// Empirically only ever observed together with the slot-1 bit.
+pub const FINGER_SLOT_2_MASK: u8 = 0x10;
+
+/// One decoded touchpad sample. Up to two simultaneous fingers are
+/// reported — slot indices match the firmware's wire layout (slot 1 at
+/// bytes 4..10, slot 2 at bytes 11..17). Released frames carry the
+/// 11-byte payload with `finger_mask == 0` and no point data.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TouchEvent {
+    /// Raw byte 3. Bit 0 set ⇒ slot 1 active; bit 4 set ⇒ slot 2 active.
+    /// Surfaced so callers can distinguish "released and decaying" frames
+    /// from "idle" frames without re-deriving from `points`.
+    pub finger_mask: u8,
+    /// Little-endian 16-bit packet counter from bytes 1..2. Increments
+    /// by `0x1E` per frame at the ~15 ms native rate, wraps at 0xFFFF.
+    pub seq: u16,
+    /// Per-slot finger data. `points[0]` is slot 1, `points[1]` is slot 2.
+    /// `None` means that slot is not in contact in this frame.
+    pub points: [Option<FingerData>; 2],
+}
+
+/// One finger's slice of a touchpad report.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FingerData {
+    /// Three bytes preceding (x, y) for this slot. Empirically a
+    /// high-precision motion accumulator that updates faster than the
+    /// 8-bit `(x, y)` pair and keeps changing for a few frames after
+    /// the finger lifts. Encoding has not been reverse-engineered, so
+    /// the bytes are surfaced raw.
+    pub motion: [u8; 3],
+    /// Slower-moving touchpad axis. Typical contact values sit in
+    /// roughly 0x40..0xc0; full extent across the touchpad has not been
+    /// mapped.
+    pub x: u8,
+    /// Faster-moving axis during left/right swipes; same coarse range
+    /// as `x`.
+    pub y: u8,
+    /// Goes `0` on release, rises with firmer contact. Typical light
+    /// touch peaks around `0x14..0x1c`; a hard click reaches ~`0x25+`.
+    pub pressure: u8,
+    /// State / flags byte for this slot. Bits empirically mix
+    /// touch-active state with quadrant hints; not all bits are
+    /// understood, so emit the raw value rather than invent labels.
+    pub status: u8,
+}
+
+impl TouchEvent {
+    /// Try to parse one touchpad HID Input report. Returns `None` when
+    /// the payload is not a well-formed 0xFC report (wrong length or
+    /// missing the 0x32 marker); the caller should fall back to a
+    /// raw-hex dump in that case.
+    pub fn parse(payload: &[u8]) -> Option<Self> {
+        let len = payload.len();
+        if (len != TOUCH_REPORT_LEN_1F && len != TOUCH_REPORT_LEN_2F)
+            || payload[0] != TOUCH_MARKER
+        {
+            return None;
+        }
+        let seq = u16::from_le_bytes([payload[1], payload[2]]);
+        let finger_mask = payload[3];
+        let slot1 = if finger_mask & FINGER_SLOT_1_MASK != 0 {
+            Some(FingerData {
+                motion: [payload[4], payload[5], payload[6]],
+                x: payload[7],
+                y: payload[8],
+                pressure: payload[9],
+                status: payload[10],
+            })
+        } else {
+            None
+        };
+        // Slot 2 data is only present in the 18-byte layout. Treat a
+        // slot-2 mask bit on a short payload as a wire-format error
+        // (no observed case, but reject rather than read OOB).
+        let slot2 = if finger_mask & FINGER_SLOT_2_MASK != 0 {
+            if len < TOUCH_REPORT_LEN_2F {
+                return None;
+            }
+            Some(FingerData {
+                motion: [payload[11], payload[12], payload[13]],
+                x: payload[14],
+                y: payload[15],
+                pressure: payload[16],
+                status: payload[17],
+            })
+        } else {
+            None
+        };
+        Some(Self {
+            finger_mask,
+            seq,
+            points: [slot1, slot2],
+        })
+    }
+
+    /// Number of fingers currently in contact (0, 1, or 2).
+    pub fn finger_count(&self) -> u8 {
+        self.points.iter().filter(|p| p.is_some()).count() as u8
+    }
+
+    /// Render a single line summary. Released frames lead with
+    /// `released`; touched frames lead with `fingers=N` and emit one
+    /// `[1: …]` / `[2: …]` block per active slot.
+    pub fn format(&self) -> String {
+        let fingers = self.finger_count();
+        if fingers == 0 {
+            return format!(
+                "touch released mask=0x{:02x} seq=0x{:04x}",
+                self.finger_mask, self.seq,
+            );
+        }
+        let mut out = format!("touch fingers={fingers}");
+        for (idx, slot) in self.points.iter().enumerate() {
+            if let Some(f) = slot {
+                let slot_no = idx + 1;
+                let _ = write!(
+                    out,
+                    " [{slot_no}: x={} y={} pressure={} motion={:02x}{:02x}{:02x} \
+                     status=0x{:02x}]",
+                    f.x, f.y, f.pressure,
+                    f.motion[0], f.motion[1], f.motion[2],
+                    f.status,
+                );
+            }
+        }
+        let _ = write!(out, " mask=0x{:02x} seq=0x{:04x}", self.finger_mask, self.seq);
+        out
+    }
+}
+
 /// Compose a full event line — timestamp, source label, identifier slot, raw
 /// hex dump, and decoded description.
 ///
@@ -213,8 +364,9 @@ mod tests {
     #[test]
     fn button_list_single_bit() {
         // Byte-0 bits (system buttons).
-        assert_eq!(button_list(0x0001), "Select");
-        assert_eq!(button_list(0x0080), "TV");
+        assert_eq!(button_list(0x0001), "TV");
+        assert_eq!(button_list(0x0008), "Select");
+        assert_eq!(button_list(0x0080), "Mute");
         // Byte-1 bits (clickpad directional + Play/Pause).
         assert_eq!(button_list(0x0100), "Play/Pause");
         assert_eq!(button_list(0x1000), "Right");
@@ -222,10 +374,10 @@ mod tests {
 
     #[test]
     fn button_list_combination_in_table_order() {
-        // Volume Up (0x0002) + Mute (0x0008) — must appear in declaration order.
-        assert_eq!(button_list(0x000A), "Volume Up+Mute");
-        // Select (0x0001) + Play/Pause (0x0100) — byte-0 entry first.
-        assert_eq!(button_list(0x0101), "Select+Play/Pause");
+        // Volume Up (0x0002) + Select (0x0008) — must appear in declaration order.
+        assert_eq!(button_list(0x000A), "Volume Up+Select");
+        // TV (0x0001) + Play/Pause (0x0100) — byte-0 entry first.
+        assert_eq!(button_list(0x0101), "TV+Play/Pause");
         // Up (0x0200) + Down (0x0400) — both byte-1, in table order.
         assert_eq!(button_list(0x0600), "Up+Down");
     }
@@ -236,7 +388,7 @@ mod tests {
         // phantom names.
         assert_eq!(button_list(0xE000), "none");
         // Mapped + unmapped: only the mapped bit renders.
-        assert_eq!(button_list(0x2001), "Select");
+        assert_eq!(button_list(0x2001), "TV");
     }
 
     #[test]
@@ -284,10 +436,10 @@ mod tests {
     #[test]
     fn input_decoder_combines_byte0_and_byte1_into_u16_mask() {
         let mut d = InputDecoder::new();
-        // Up (byte1 bit 0x02 -> mask 0x0200) + Select (byte0 bit 0x01 -> 0x0001).
+        // Up (byte1 bit 0x02 -> mask 0x0200) + TV (byte0 bit 0x01 -> 0x0001).
         let line = d.format(&[0x01, 0x02]);
         assert!(
-            line.contains("buttons=Select+Up pressed=Select+Up released=none"),
+            line.contains("buttons=TV+Up pressed=TV+Up released=none"),
             "expected combined byte-0/byte-1 decode, got: {line}",
         );
     }
@@ -322,5 +474,125 @@ mod tests {
         assert_eq!(raw_hex(&[]), "");
         assert_eq!(raw_hex(&[0x01]), "01");
         assert_eq!(raw_hex(&[0x01, 0xab, 0x00]), "01 ab 00");
+    }
+
+    #[test]
+    fn touch_parse_rejects_wrong_length_and_marker() {
+        assert!(TouchEvent::parse(&[]).is_none());
+        // Right length, wrong marker.
+        assert!(TouchEvent::parse(&[0x00; 11]).is_none());
+        // Right marker, wrong length.
+        assert!(TouchEvent::parse(&[0x32, 0x00, 0x00]).is_none());
+    }
+
+    #[test]
+    fn touch_parse_decodes_active_touch() {
+        // Captured from a real DNDJ22MG2330 mid-swipe:
+        // 32 14 a6 01 c0 1e e6 9e 8e 1a a4
+        let bytes = [
+            0x32, 0x14, 0xa6, 0x01, 0xc0, 0x1e, 0xe6, 0x9e, 0x8e, 0x1a, 0xa4,
+        ];
+        let ev = TouchEvent::parse(&bytes).expect("valid touch packet");
+        assert_eq!(ev.finger_mask, 0x01);
+        assert_eq!(ev.finger_count(), 1);
+        assert_eq!(ev.seq, 0xa614);
+        let f = ev.points[0].expect("slot 1 present while touching");
+        assert_eq!(f.motion, [0xc0, 0x1e, 0xe6]);
+        assert_eq!((f.x, f.y, f.pressure), (0x9e, 0x8e, 0x1a));
+        assert_eq!(f.status, 0xa4);
+        assert!(ev.points[1].is_none(), "slot 2 must be empty in 11-byte payload");
+    }
+
+    #[test]
+    fn touch_parse_decodes_release_with_zeroed_point() {
+        // Trailing release frame from the same swipe:
+        // 32 e6 a6 00 c3 ee e6 00 00 00 87
+        let bytes = [
+            0x32, 0xe6, 0xa6, 0x00, 0xc3, 0xee, 0xe6, 0x00, 0x00, 0x00, 0x87,
+        ];
+        let ev = TouchEvent::parse(&bytes).expect("valid release packet");
+        assert_eq!(ev.finger_mask, 0x00);
+        assert_eq!(ev.finger_count(), 0);
+        assert!(ev.points.iter().all(|p| p.is_none()));
+        assert_eq!(ev.seq, 0xa6e6);
+    }
+
+    #[test]
+    fn touch_parse_decodes_two_finger_report() {
+        // Captured from a real DNDJ22MG2330 with two fingers on the
+        // touchpad: 18 bytes, mask byte 0x11 (slot 1 + slot 2).
+        // 32 a0 89 11 77 60 f8 47 5a 0f 8b 41 0d e2 41 55 0e 83
+        let bytes = [
+            0x32, 0xa0, 0x89, 0x11, 0x77, 0x60, 0xf8, 0x47, 0x5a, 0x0f, 0x8b, 0x41, 0x0d, 0xe2,
+            0x41, 0x55, 0x0e, 0x83,
+        ];
+        let ev = TouchEvent::parse(&bytes).expect("valid two-finger packet");
+        assert_eq!(ev.finger_mask, 0x11);
+        assert_eq!(ev.finger_count(), 2);
+        assert_eq!(ev.seq, 0x89a0);
+        let f1 = ev.points[0].expect("slot 1 active");
+        assert_eq!(f1.motion, [0x77, 0x60, 0xf8]);
+        assert_eq!((f1.x, f1.y, f1.pressure), (0x47, 0x5a, 0x0f));
+        assert_eq!(f1.status, 0x8b);
+        let f2 = ev.points[1].expect("slot 2 active");
+        assert_eq!(f2.motion, [0x41, 0x0d, 0xe2]);
+        assert_eq!((f2.x, f2.y, f2.pressure), (0x41, 0x55, 0x0e));
+        assert_eq!(f2.status, 0x83);
+    }
+
+    #[test]
+    fn touch_parse_rejects_slot2_bit_on_short_payload() {
+        // Mask claims slot 2 is active but payload only has 11 bytes —
+        // refuse to read past the buffer.
+        let bytes = [
+            0x32, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        assert!(TouchEvent::parse(&bytes).is_none());
+    }
+
+    #[test]
+    fn touch_format_active_includes_position_and_pressure() {
+        let ev = TouchEvent::parse(&[
+            0x32, 0x14, 0xa6, 0x01, 0xc0, 0x1e, 0xe6, 0x9e, 0x8e, 0x1a, 0xa4,
+        ])
+        .unwrap();
+        let line = ev.format();
+        assert!(
+            line.contains("touch fingers=1"),
+            "missing fingers tag: {line}",
+        );
+        assert!(
+            line.contains("[1: x=158 y=142 pressure=26"),
+            "missing slot-1 position: {line}",
+        );
+        assert!(line.contains("status=0xa4"), "missing status: {line}");
+        assert!(line.contains("seq=0xa614"), "missing seq: {line}");
+        assert!(line.contains("motion=c01ee6"), "missing motion bytes: {line}");
+    }
+
+    #[test]
+    fn touch_format_two_fingers_emits_both_slots() {
+        let ev = TouchEvent::parse(&[
+            0x32, 0xa0, 0x89, 0x11, 0x77, 0x60, 0xf8, 0x47, 0x5a, 0x0f, 0x8b, 0x41, 0x0d, 0xe2,
+            0x41, 0x55, 0x0e, 0x83,
+        ])
+        .unwrap();
+        let line = ev.format();
+        assert!(line.contains("touch fingers=2"), "{line}");
+        assert!(line.contains("[1: x=71 y=90 pressure=15"), "{line}");
+        assert!(line.contains("[2: x=65 y=85 pressure=14"), "{line}");
+        assert!(line.contains("mask=0x11"), "{line}");
+    }
+
+    #[test]
+    fn touch_format_release_uses_released_label() {
+        let ev = TouchEvent::parse(&[
+            0x32, 0xe6, 0xa6, 0x00, 0xc3, 0xee, 0xe6, 0x00, 0x00, 0x00, 0x87,
+        ])
+        .unwrap();
+        let line = ev.format();
+        assert!(line.starts_with("touch released"), "expected released prefix: {line}");
+        assert!(!line.contains(" x="), "released frame must not advertise x/y: {line}");
+        assert!(line.contains("mask=0x00"));
     }
 }

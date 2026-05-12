@@ -14,7 +14,9 @@ use tokio::time::{Instant, timeout};
 use uuid::Uuid;
 
 use crate::cli::EventsArgs;
-use crate::decoder::{InputDecoder, format_battery, format_event, format_power, raw_hex};
+use crate::decoder::{
+    InputDecoder, TouchEvent, format_battery, format_event, format_power, now_stamp, raw_hex,
+};
 use crate::hid::{
     BATTERY_LEVEL_UUID, BATTERY_POWER_UUID, HID_REPORT_UUID, all_characteristics, find_by_uuid,
 };
@@ -491,21 +493,28 @@ async fn drain_notifications(
             r = hid_stream.next_report() => {
                 let Some((report_id, value)) = r else { return Ok(()) };
                 let identifier = format!("report_id=0x{report_id:02X}");
-                // The shipped decoder reads `data[1]` as a button mask and
-                // `data[2] == 0x32` as a touch-event marker. That layout
-                // matches the gen-1 2-byte button report (and only that) on
-                // this firmware; the gen-3 touch/audio reports have very
-                // different layouts and the decoder happily produces
-                // garbage like "buttons=Volume Up+Play/Pause+Siri+…" out of
-                // their phase counters. Run the decoder only on the 2-byte
-                // button reports; for everything else emit raw hex so the
-                // user still sees the wire data without false labels.
+                // Dispatch by payload shape: 2-byte button reports (gen-3
+                // 0xFB) feed `InputDecoder` for press/release deltas; 11-byte
+                // touch reports (gen-3 0xFC, payload prefixed with 0x32)
+                // feed `TouchEvent::parse` for finger / coords / pressure.
+                // Anything else is dumped raw — gen-3 also exposes a 0xFA
+                // audio report and a 0x60 report whose layouts have not
+                // been reverse-engineered, and inventing labels for those
+                // would be worse than showing the wire bytes.
                 let line = if value.len() == 2 {
                     format_event("input", &identifier, &value, Some(decoder))
+                } else if let Some(touch) = TouchEvent::parse(&value) {
+                    format!(
+                        "{} input {} raw={} | {}",
+                        now_stamp(),
+                        identifier,
+                        raw_hex(&value),
+                        touch.format(),
+                    )
                 } else {
                     format!(
                         "{} input {} raw={}",
-                        crate::decoder::now_stamp(),
+                        now_stamp(),
                         identifier,
                         raw_hex(&value),
                     )
