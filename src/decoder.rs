@@ -191,6 +191,29 @@ pub const FINGER_SLOT_1_MASK: u8 = 0x01;
 /// Empirically only ever observed together with the slot-1 bit.
 pub const FINGER_SLOT_2_MASK: u8 = 0x10;
 
+/// Y-axis offset baked into the firmware's wire encoding.
+///
+/// Per the SiriRemote-Linux reverse-engineering notes, byte [2] of a
+/// finger payload sweeps `188..=255` then `0..=38` going bottom-to-top
+/// across the touchpad. We decode that as a signed value relative to
+/// `188` so 0 sits at the bottom edge and ~106 at the top edge — the
+/// Python reference uses the equivalent
+/// `(b if b & 0x80 else b + 255) - 188` formulation.
+pub const TOUCH_Y_OFFSET: i16 = 188;
+
+/// Number of horizontal "zones" the firmware splits the touchpad into.
+/// The lower 3 bits of byte [1] of a finger payload select the zone
+/// (0..=7); byte [0] is the position within the zone (0..=255). X is
+/// reconstructed as `byte[0] + 255 * (byte[1] & 7)`, giving an 11-bit
+/// value in `0..=2040`.
+pub const TOUCH_X_ZONES: u8 = 8;
+/// Mask that picks the zone bits out of finger byte [1].
+pub const TOUCH_X_ZONE_MASK: u8 = 0x07;
+
+/// Maximum value the encoded X can take (`255 * (TOUCH_X_ZONES - 1) + 255`).
+/// Higher physical motion wraps back to small X values.
+pub const TOUCH_X_MAX: u16 = 255 * (TOUCH_X_ZONES as u16 - 1) + 255;
+
 /// One decoded touchpad sample. Up to two simultaneous fingers are
 /// reported — slot indices match the firmware's wire layout (slot 1 at
 /// bytes 4..10, slot 2 at bytes 11..17). Released frames carry the
@@ -210,28 +233,39 @@ pub struct TouchEvent {
 }
 
 /// One finger's slice of a touchpad report.
+///
+/// The firmware ships seven bytes per active slot. The first three
+/// pack the high-precision finger position (X across two bytes plus
+/// zone bits, then Y as a signed wrap byte); the next two are an
+/// undocumented payload that co-varies with pressure / contact area;
+/// then pressure and a status byte. Layout matches the gen-1/gen-2
+/// SiriRemote-Linux reference, confirmed empirically on gen-3.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FingerData {
-    /// Three bytes preceding (x, y) for this slot. Empirically a
-    /// high-precision motion accumulator that updates faster than the
-    /// 8-bit `(x, y)` pair and keeps changing for a few frames after
-    /// the finger lifts. Encoding has not been reverse-engineered, so
-    /// the bytes are surfaced raw.
-    pub motion: [u8; 3],
-    /// Slower-moving touchpad axis. Typical contact values sit in
-    /// roughly 0x40..0xc0; full extent across the touchpad has not been
-    /// mapped.
-    pub x: u8,
-    /// Faster-moving axis during left/right swipes; same coarse range
-    /// as `x`.
-    pub y: u8,
-    /// Goes `0` on release, rises with firmer contact. Typical light
-    /// touch peaks around `0x14..0x1c`; a hard click reaches ~`0x25+`.
+    /// 11-bit horizontal position in `0..=TOUCH_X_MAX`. Increases
+    /// left-to-right and wraps from `TOUCH_X_MAX` back to `0` at the
+    /// zone boundary, so callers tracking continuous motion need to
+    /// unwrap across consecutive samples.
+    pub x: u16,
+    /// Vertical position relative to the firmware's `188` offset.
+    /// Increases bottom-to-top; sits roughly in `0..=106` across the
+    /// touchpad's active area, with `<0` and `>106` reachable at the
+    /// extreme corners.
+    pub y: i16,
+    /// Pressure byte. `0` immediately before release, peaks around
+    /// `0x14..0x1c` for a light touch and `0x25+` for a hard click.
     pub pressure: u8,
-    /// State / flags byte for this slot. Bits empirically mix
-    /// touch-active state with quadrant hints; not all bits are
-    /// understood, so emit the raw value rather than invent labels.
+    /// Status / quadrant byte. Bits empirically mix touch state with
+    /// what looks like quadrant hints; not fully decoded, surfaced raw.
     pub status: u8,
+    /// Two undocumented bytes (finger payload indices 3 and 4) that we
+    /// previously misread as `(x, y)`. They scale with pressure and
+    /// contact-ellipse size and do **not** carry position information.
+    /// Surfaced raw for diagnostics until their role is reverse-engineered.
+    pub aux: [u8; 2],
+    /// Upper five bits of finger byte [1] (the lower three feed the X
+    /// zone). Empirically a slow counter; surfaced for diagnostics.
+    pub byte1_high: u8,
 }
 
 impl TouchEvent {
@@ -249,13 +283,15 @@ impl TouchEvent {
         let seq = u16::from_le_bytes([payload[1], payload[2]]);
         let finger_mask = payload[3];
         let slot1 = if finger_mask & FINGER_SLOT_1_MASK != 0 {
-            Some(FingerData {
-                motion: [payload[4], payload[5], payload[6]],
-                x: payload[7],
-                y: payload[8],
-                pressure: payload[9],
-                status: payload[10],
-            })
+            Some(FingerData::decode([
+                payload[4],
+                payload[5],
+                payload[6],
+                payload[7],
+                payload[8],
+                payload[9],
+                payload[10],
+            ]))
         } else {
             None
         };
@@ -266,13 +302,15 @@ impl TouchEvent {
             if len < TOUCH_REPORT_LEN_2F {
                 return None;
             }
-            Some(FingerData {
-                motion: [payload[11], payload[12], payload[13]],
-                x: payload[14],
-                y: payload[15],
-                pressure: payload[16],
-                status: payload[17],
-            })
+            Some(FingerData::decode([
+                payload[11],
+                payload[12],
+                payload[13],
+                payload[14],
+                payload[15],
+                payload[16],
+                payload[17],
+            ]))
         } else {
             None
         };
@@ -305,16 +343,55 @@ impl TouchEvent {
                 let slot_no = idx + 1;
                 let _ = write!(
                     out,
-                    " [{slot_no}: x={} y={} pressure={} motion={:02x}{:02x}{:02x} \
-                     status=0x{:02x}]",
-                    f.x, f.y, f.pressure,
-                    f.motion[0], f.motion[1], f.motion[2],
-                    f.status,
+                    " [{slot_no}: x={} y={} pressure={} status=0x{:02x} \
+                     aux={:02x}{:02x} byte1_high=0x{:02x}]",
+                    f.x, f.y, f.pressure, f.status, f.aux[0], f.aux[1], f.byte1_high,
                 );
             }
         }
         let _ = write!(out, " mask=0x{:02x} seq=0x{:04x}", self.finger_mask, self.seq);
         out
+    }
+}
+
+impl FingerData {
+    /// Decode the 7-byte per-finger payload using the layout documented
+    /// in `SiriRemote-Linux/README.md` (gen-2 wire format, confirmed
+    /// empirically on the gen-3 DNDJ22MG2330):
+    ///
+    /// | byte | role |
+    /// |------|------|
+    /// | 0    | X low byte (within zone) |
+    /// | 1    | bits 0..2: X zone (`& 7`); bits 3..7: unknown counter |
+    /// | 2    | Y signed wrap byte, offset by `188` |
+    /// | 3    | unknown (co-varies with pressure / contact size) |
+    /// | 4    | unknown (co-varies with pressure / contact size) |
+    /// | 5    | pressure |
+    /// | 6    | status / quadrant flags |
+    fn decode(b: [u8; 7]) -> Self {
+        let zone = (b[1] & TOUCH_X_ZONE_MASK) as u16;
+        debug_assert!(zone < TOUCH_X_ZONES as u16);
+        let x = b[0] as u16 + 255 * zone;
+        debug_assert!(x <= TOUCH_X_MAX);
+        // Y mirrors the SiriRemote-Linux Python decoder:
+        //   (b if b & 0x80 else b + 255) - 188
+        // which is "treat byte as signed offset around 188" with the
+        // 0..127 range shifted up by 255 so the wrap matches the
+        // touchpad's bottom→top sweep without a discontinuity inside
+        // the active area.
+        let y = if b[2] & 0x80 != 0 {
+            b[2] as i16 - TOUCH_Y_OFFSET
+        } else {
+            b[2] as i16 + 255 - TOUCH_Y_OFFSET
+        };
+        Self {
+            x,
+            y,
+            pressure: b[5],
+            status: b[6],
+            aux: [b[3], b[4]],
+            byte1_high: b[1] >> 3,
+        }
     }
 }
 
@@ -497,9 +574,12 @@ mod tests {
         assert_eq!(ev.finger_count(), 1);
         assert_eq!(ev.seq, 0xa614);
         let f = ev.points[0].expect("slot 1 present while touching");
-        assert_eq!(f.motion, [0xc0, 0x1e, 0xe6]);
-        assert_eq!((f.x, f.y, f.pressure), (0x9e, 0x8e, 0x1a));
+        assert_eq!(f.x, 192 + 255 * 6, "x = byte0 + 255 * (byte1 & 7)");
+        assert_eq!(f.y, 0xe6 - 188, "y = byte2 - 188 because bit 7 is set");
+        assert_eq!(f.pressure, 0x1a);
         assert_eq!(f.status, 0xa4);
+        assert_eq!(f.aux, [0x9e, 0x8e]);
+        assert_eq!(f.byte1_high, 0x1e >> 3);
         assert!(ev.points[1].is_none(), "slot 2 must be empty in 11-byte payload");
     }
 
@@ -531,13 +611,17 @@ mod tests {
         assert_eq!(ev.finger_count(), 2);
         assert_eq!(ev.seq, 0x89a0);
         let f1 = ev.points[0].expect("slot 1 active");
-        assert_eq!(f1.motion, [0x77, 0x60, 0xf8]);
-        assert_eq!((f1.x, f1.y, f1.pressure), (0x47, 0x5a, 0x0f));
+        assert_eq!(f1.x, 0x77 + 255 * 0, "slot1 zone is 0");
+        assert_eq!(f1.y, 0xf8 - 188);
+        assert_eq!(f1.pressure, 0x0f);
         assert_eq!(f1.status, 0x8b);
+        assert_eq!(f1.aux, [0x47, 0x5a]);
         let f2 = ev.points[1].expect("slot 2 active");
-        assert_eq!(f2.motion, [0x41, 0x0d, 0xe2]);
-        assert_eq!((f2.x, f2.y, f2.pressure), (0x41, 0x55, 0x0e));
+        assert_eq!(f2.x, 0x41 + 255 * 5, "slot2 zone is 5");
+        assert_eq!(f2.y, 0xe2 - 188);
+        assert_eq!(f2.pressure, 0x0e);
         assert_eq!(f2.status, 0x83);
+        assert_eq!(f2.aux, [0x41, 0x55]);
     }
 
     #[test]
@@ -561,13 +645,16 @@ mod tests {
             line.contains("touch fingers=1"),
             "missing fingers tag: {line}",
         );
+        // x = 0xc0 + 255 * (0x1e & 7) = 192 + 1530 = 1722
+        // y = 0xe6 - 188 = 42 (bit 7 set)
         assert!(
-            line.contains("[1: x=158 y=142 pressure=26"),
-            "missing slot-1 position: {line}",
+            line.contains("[1: x=1722 y=42 pressure=26"),
+            "missing decoded slot-1 position: {line}",
         );
         assert!(line.contains("status=0xa4"), "missing status: {line}");
         assert!(line.contains("seq=0xa614"), "missing seq: {line}");
-        assert!(line.contains("motion=c01ee6"), "missing motion bytes: {line}");
+        assert!(line.contains("aux=9e8e"), "missing aux bytes: {line}");
+        assert!(line.contains("byte1_high=0x03"), "missing byte1_high: {line}");
     }
 
     #[test]
@@ -579,8 +666,10 @@ mod tests {
         .unwrap();
         let line = ev.format();
         assert!(line.contains("touch fingers=2"), "{line}");
-        assert!(line.contains("[1: x=71 y=90 pressure=15"), "{line}");
-        assert!(line.contains("[2: x=65 y=85 pressure=14"), "{line}");
+        // slot 1: x = 0x77 + 255*0 = 119, y = 0xf8 - 188 = 60
+        assert!(line.contains("[1: x=119 y=60 pressure=15"), "{line}");
+        // slot 2: x = 0x41 + 255*5 = 1340, y = 0xe2 - 188 = 38
+        assert!(line.contains("[2: x=1340 y=38 pressure=14"), "{line}");
         assert!(line.contains("mask=0x11"), "{line}");
     }
 
