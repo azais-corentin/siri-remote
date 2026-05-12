@@ -27,6 +27,10 @@ pub enum Command {
     /// Use `--touch` for touchpad frames (report id 0xFC) and/or `--mic` for microphone-audio
     /// frames emitted while the Siri button is held (report id 0xFA). At least one is required.
     Dump(DumpArgs),
+    /// Connect a bonded (or pairing-mode) remote, decode the Opus microphone
+    /// audio stream emitted on HID input report 0xFA while the Siri button is
+    /// held, and expose it as a PipeWire virtual microphone (Audio/Source).
+    Mic(MicArgs),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -103,4 +107,28 @@ pub struct DumpArgs {
     /// (HID input report id 0xFA).
     #[arg(long, default_value_t = false)]
     pub mic: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct MicArgs {
+    /// Specific bonded Siri Remote identity address (skips initial scan).
+    #[arg(long)]
+    pub address: Option<String>,
+
+    /// Seconds to scan before falling back to address-based connect.
+    #[arg(long, default_value_t = 5.0)]
+    pub scan_seconds: f64,
+
+    /// Delay before reconnect attempts after disconnect/failure.
+    #[arg(long, default_value_t = 0.5)]
+    pub reconnect_delay: f64,
+
+    /// PipeWire node name (the stable identifier consumers use to target the
+    /// virtual microphone, e.g. `pw-record --target=siri-remote`).
+    #[arg(long, default_value = "siri-remote")]
+    pub node_name: String,
+
+    /// Human-readable PipeWire node description (shown in mixers / pavucontrol).
+    #[arg(long, default_value = "Siri Remote microphone")]
+    pub node_description: String,
 }
