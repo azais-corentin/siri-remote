@@ -23,8 +23,10 @@ pub enum Command {
     View(ViewArgs),
     /// Remove all paired/bonded Siri Remotes via BlueZ Adapter1.RemoveDevice (Linux only).
     Unpair(UnpairArgs),
-    /// Connect a bonded (or pairing-mode) remote and dump raw touchpad-report bytes to stdout.
-    TouchDump(TouchDumpArgs),
+    /// Connect a bonded (or pairing-mode) remote and dump raw HID input report bytes to stdout.
+    /// Use `--touch` for touchpad frames (report id 0xFC) and/or `--mic` for microphone-audio
+    /// frames emitted while the Siri button is held (report id 0xFA). At least one is required.
+    Dump(DumpArgs),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -80,7 +82,7 @@ pub struct ViewArgs {
 }
 
 #[derive(Args, Debug, Clone)]
-pub struct TouchDumpArgs {
+pub struct DumpArgs {
     /// Specific bonded Siri Remote identity address (skips initial scan).
     #[arg(long)]
     pub address: Option<String>,
@@ -92,4 +94,13 @@ pub struct TouchDumpArgs {
     /// Delay before reconnect attempts after disconnect/failure.
     #[arg(long, default_value_t = 0.5)]
     pub reconnect_delay: f64,
+
+    /// Capture touchpad-report frames (HID input report id 0xFC).
+    #[arg(long, default_value_t = false)]
+    pub touch: bool,
+
+    /// Capture microphone-audio frames emitted while the Siri button is held
+    /// (HID input report id 0xFA).
+    #[arg(long, default_value_t = false)]
+    pub mic: bool,
 }
