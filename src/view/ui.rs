@@ -222,7 +222,7 @@ fn draw_siri_pill(ctx: &mut Context<'_>, state: &AppState, now: Instant) {
     // Vertical pill on the right edge.
     ctx.draw(&Rectangle {
         x: 88.0,
-        y: 170.0,
+        y: 210.0,
         width: 2.0,
         height: 40.0,
         color,
@@ -230,13 +230,13 @@ fn draw_siri_pill(ctx: &mut Context<'_>, state: &AppState, now: Instant) {
     // Round the ends.
     ctx.draw(&Circle {
         x: 89.0,
-        y: 170.0,
+        y: 210.0,
         radius: 1.0,
         color,
     });
     ctx.draw(&Circle {
         x: 89.0,
-        y: 210.0,
+        y: 250.0,
         radius: 1.0,
         color,
     });
@@ -558,56 +558,101 @@ fn draw_play_pause(ctx: &mut Context<'_>, state: &AppState, now: Instant) {
 fn draw_volume(ctx: &mut Context<'_>, state: &AppState, now: Instant) {
     let up = style_for_bit(state, 0x0002, now);
     let dn = style_for_bit(state, 0x0004, now);
-    // Upper half body (+ bit).
-    ctx.draw(&Rectangle {
-        x: 56.5,
-        y: 110.0,
-        width: 27.0,
-        height: 30.0,
+
+    // Volume pill — caps at row 2 (+) and row 3 (−). Outline is drawn
+    // directly (semicircle arcs + side lines + divider) so the cap and body
+    // share an unbroken silhouette; using full `Circle` + `Rectangle`
+    // outlines would leave visible seams where the cap rim crosses the
+    // rectangle edge.
+    let cx = 70.0_f64;
+    let r = 13.5_f64;
+    let top_cy = 140.0_f64; // + cap center (row 2)
+    let bot_cy = 100.0_f64; // − cap center (row 3)
+    let mid_y = (top_cy + bot_cy) / 2.0;
+
+    // Straight sides, split at the divider so each half tracks its own bit.
+    ctx.draw(&CanvasLine {
+        x1: cx - r,
+        y1: mid_y,
+        x2: cx - r,
+        y2: top_cy,
         color: up,
     });
-    // Lower half body (− bit).
-    ctx.draw(&Rectangle {
-        x: 56.5,
-        y: 80.0,
-        width: 27.0,
-        height: 30.0,
+    ctx.draw(&CanvasLine {
+        x1: cx + r,
+        y1: mid_y,
+        x2: cx + r,
+        y2: top_cy,
+        color: up,
+    });
+    ctx.draw(&CanvasLine {
+        x1: cx - r,
+        y1: bot_cy,
+        x2: cx - r,
+        y2: mid_y,
         color: dn,
     });
-    // Rounded caps: top cap follows + highlight, bottom cap follows −.
-    ctx.draw(&Circle {
-        x: 70.0,
-        y: 140.0,
-        radius: 13.5,
-        color: up,
-    });
-    ctx.draw(&Circle {
-        x: 70.0,
-        y: 80.0,
-        radius: 13.5,
+    ctx.draw(&CanvasLine {
+        x1: cx + r,
+        y1: bot_cy,
+        x2: cx + r,
+        y2: mid_y,
         color: dn,
     });
-    // + glyph at (70, 125).
+
+    // Divider between + and − halves.
     ctx.draw(&CanvasLine {
-        x1: 64.0,
-        y1: 125.0,
-        x2: 76.0,
-        y2: 125.0,
+        x1: cx - r,
+        y1: mid_y,
+        x2: cx + r,
+        y2: mid_y,
+        color: up,
+    });
+
+    // Cap arcs: upper semicircle for the + cap, lower semicircle for −.
+    // Sampling the outline manually means the inner half of each cap
+    // (which would otherwise cross the body) simply isn't drawn.
+    const ARC_SAMPLES: usize = 48;
+    let mut top_arc = [(0.0_f64, 0.0_f64); ARC_SAMPLES];
+    for (k, p) in top_arc.iter_mut().enumerate() {
+        let theta = std::f64::consts::PI * (k as f64) / ((ARC_SAMPLES - 1) as f64);
+        *p = (cx + r * theta.cos(), top_cy + r * theta.sin());
+    }
+    ctx.draw(&Points {
+        coords: &top_arc,
+        color: up,
+    });
+    let mut bot_arc = [(0.0_f64, 0.0_f64); ARC_SAMPLES];
+    for (k, p) in bot_arc.iter_mut().enumerate() {
+        let theta = std::f64::consts::PI * (1.0 + (k as f64) / ((ARC_SAMPLES - 1) as f64));
+        *p = (cx + r * theta.cos(), bot_cy + r * theta.sin());
+    }
+    ctx.draw(&Points {
+        coords: &bot_arc,
+        color: dn,
+    });
+
+    // + glyph centered on the upper cap.
+    ctx.draw(&CanvasLine {
+        x1: cx - 6.0,
+        y1: top_cy,
+        x2: cx + 6.0,
+        y2: top_cy,
         color: up,
     });
     ctx.draw(&CanvasLine {
-        x1: 70.0,
-        y1: 119.0,
-        x2: 70.0,
-        y2: 131.0,
+        x1: cx,
+        y1: top_cy - 6.0,
+        x2: cx,
+        y2: top_cy + 6.0,
         color: up,
     });
-    // − glyph at (70, 95).
+    // − glyph centered on the lower cap.
     ctx.draw(&CanvasLine {
-        x1: 64.0,
-        y1: 95.0,
-        x2: 76.0,
-        y2: 95.0,
+        x1: cx - 6.0,
+        y1: bot_cy,
+        x2: cx + 6.0,
+        y2: bot_cy,
         color: dn,
     });
 }
@@ -615,7 +660,7 @@ fn draw_volume(ctx: &mut Context<'_>, state: &AppState, now: Instant) {
 fn draw_mute(ctx: &mut Context<'_>, state: &AppState, now: Instant) {
     let color = style_for_bit(state, 0x0080, now);
     let cx = 30.0;
-    let cy = 80.0;
+    let cy = 100.0;
     ctx.draw(&Circle {
         x: cx,
         y: cy,
