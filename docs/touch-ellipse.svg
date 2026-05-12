@@ -1,0 +1,78 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 360 250" role="img" aria-labelledby="touch-ellipse-title touch-ellipse-desc">
+  <title id="touch-ellipse-title">Touch ellipse major/minor axes and rotation</title>
+  <desc id="touch-ellipse-desc">The major axis is rotated counter-clockwise from touchpad +X by theta. The minor axis is perpendicular to the major axis, and both axes pass through the contact center.</desc>
+  <style>
+    :root {
+      --fg: #24292f;
+      --muted: #6e7781;
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --fg: #c9d1d9;
+        --muted: #8b949e;
+      }
+    }
+
+    .fg-stroke {
+      fill: none;
+      stroke: var(--fg);
+    }
+
+    .fg-fill {
+      fill: var(--fg);
+    }
+
+    .muted-stroke {
+      fill: none;
+      stroke: var(--muted);
+    }
+
+    .muted-fill {
+      fill: var(--muted);
+    }
+  </style>
+  <defs>
+    <marker id="sr-ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" class="fg-fill"/>
+    </marker>
+  </defs>
+
+  <!-- Touchpad disc and angle quantization ticks. -->
+  <circle cx="180" cy="118" r="86" class="muted-stroke" stroke-width="1"/>
+  <g class="muted-stroke" stroke-width="1">
+    <line x1="256" y1="118" x2="270" y2="118"/>
+    <line x1="250.21" y1="88.92" x2="263.15" y2="83.56"/>
+    <line x1="233.74" y1="64.26" x2="243.64" y2="54.36"/>
+    <line x1="209.08" y1="47.79" x2="214.44" y2="34.85"/>
+    <line x1="180" y1="42" x2="180" y2="28"/>
+    <line x1="150.92" y1="47.79" x2="145.56" y2="34.85"/>
+    <line x1="126.26" y1="64.26" x2="116.36" y2="54.36"/>
+    <line x1="109.79" y1="88.92" x2="96.85" y2="83.56"/>
+  </g>
+  <text x="276" y="122" font-size="11" class="muted-fill">0°</text>
+  <text x="187" y="28" font-size="11" class="muted-fill">90°</text>
+
+  <!-- +X reference. -->
+  <line x1="180" y1="118" x2="254" y2="118" class="fg-stroke" stroke-width="0.85" marker-end="url(#sr-ah)"/>
+  <text x="258" y="122" font-size="12" class="fg-fill">+X</text>
+
+  <!-- Contact ellipse, shown with θ = 30° CCW from +X. SVG's y-axis is downward, so the transform is negative. -->
+  <ellipse cx="180" cy="118" rx="70" ry="35" class="fg-stroke" stroke-width="1.5" transform="rotate(-30 180 118)"/>
+  <circle cx="180" cy="118" r="2.5" class="fg-fill"/>
+
+  <!-- Full major/minor axes through the contact center. -->
+  <line x1="119.38" y1="153" x2="240.62" y2="83" class="fg-stroke" stroke-width="1.25" marker-start="url(#sr-ah)" marker-end="url(#sr-ah)"/>
+  <text x="232" y="78" font-size="12" class="fg-fill">major axis</text>
+  <text x="209" y="96" font-size="11" class="fg-fill">a</text>
+
+  <line x1="162.5" y1="87.69" x2="197.5" y2="148.31" class="fg-stroke" stroke-width="1.25" stroke-dasharray="4 3" marker-start="url(#sr-ah)" marker-end="url(#sr-ah)"/>
+  <text x="202" y="154" font-size="12" class="fg-fill">minor axis</text>
+  <text x="191" y="136" font-size="11" class="fg-fill">b</text>
+
+  <!-- Rotation θ from +X to the major axis. -->
+  <path d="M 224 118 A 44 44 0 0 0 218.11 96" class="fg-stroke" stroke-width="1" marker-end="url(#sr-ah)"/>
+  <text x="227" y="106" font-size="13" class="fg-fill">θ</text>
+
+  <text x="180" y="230" font-size="11" class="fg-fill" text-anchor="middle">θ = ((angle_idx + 1) mod 8) × 22.5°;  major/minor bytes scale to semi-axes a and b</text>
+</svg>
