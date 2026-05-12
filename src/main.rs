@@ -5,6 +5,7 @@ mod logger;
 mod cli;
 mod decoder;
 mod events;
+mod touch_dump;
 mod hid;
 mod pair;
 mod scan;
@@ -30,6 +31,7 @@ async fn main() -> std::process::ExitCode {
             Command::Events(args) => events::run(args).await,
             Command::Unpair(args) => unpair::run(args).await,
             Command::View(args) => view::run(args).await,
+            Command::TouchDump(args) => touch_dump::run(args).await,
         }
     };
 

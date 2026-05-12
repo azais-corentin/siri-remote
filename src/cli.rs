@@ -23,6 +23,8 @@ pub enum Command {
     View(ViewArgs),
     /// Remove all paired/bonded Siri Remotes via BlueZ Adapter1.RemoveDevice (Linux only).
     Unpair(UnpairArgs),
+    /// Connect a bonded (or pairing-mode) remote and dump raw touchpad-report bytes to stdout.
+    TouchDump(TouchDumpArgs),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -64,6 +66,21 @@ pub struct UnpairArgs {
 
 #[derive(Args, Debug, Clone)]
 pub struct ViewArgs {
+    /// Specific bonded Siri Remote identity address (skips initial scan).
+    #[arg(long)]
+    pub address: Option<String>,
+
+    /// Seconds to scan before falling back to address-based connect.
+    #[arg(long, default_value_t = 5.0)]
+    pub scan_seconds: f64,
+
+    /// Delay before reconnect attempts after disconnect/failure.
+    #[arg(long, default_value_t = 0.5)]
+    pub reconnect_delay: f64,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct TouchDumpArgs {
     /// Specific bonded Siri Remote identity address (skips initial scan).
     #[arg(long)]
     pub address: Option<String>,
