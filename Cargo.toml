@@ -19,6 +19,8 @@ hex = "0.4"
 ratatui = "0.29"
 crossterm = { version = "0.28", features = ["event-stream"] }
 log = "0.4.29"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 zbus = { version = "5", default-features = false, features = ["tokio"] }

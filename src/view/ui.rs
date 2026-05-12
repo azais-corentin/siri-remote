@@ -57,9 +57,22 @@ pub fn draw(frame: &mut Frame<'_>, state: &AppState) {
 // --- Remote canvas ----------------------------------------------------------
 
 fn draw_remote(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
+    let title: Vec<Span<'_>> = if state.is_calibrating() {
+        vec![
+            Span::styled("Remote ", Style::default().fg(Color::Gray)),
+            Span::styled(
+                "— CALIBRATING",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]
+    } else {
+        vec![Span::styled("Remote", Style::default().fg(Color::Gray))]
+    };
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(Span::styled("Remote", Style::default().fg(Color::Gray)));
+        .title(Line::from(title));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -96,6 +109,11 @@ fn paint_remote(ctx: &mut Context<'_>, state: &AppState) {
 
     // 5. Touch trail.
     draw_trail(ctx, &state.touch_trail, now);
+    ctx.layer();
+
+    // 5b. Running calibration bounds overlay (firmware-space rectangle
+    //     projected onto the touchpad disc).
+    draw_calibration_overlay(ctx, state);
     ctx.layer();
 
     // 6. Button cluster below touchpad.
@@ -298,6 +316,42 @@ fn draw_trail(ctx: &mut Context<'_>, trail: &std::collections::VecDeque<TrailPoi
             color,
         });
     }
+}
+
+/// While calibrating, project the running min/max rectangle from firmware
+/// coordinates onto the touchpad disc so the user can see what their
+/// current swing covers. Idle mode is a no-op.
+fn draw_calibration_overlay(ctx: &mut Context<'_>, state: &AppState) {
+    let Some(session) = state.calibration_session() else {
+        return;
+    };
+    if session.samples == 0 {
+        return;
+    }
+    use crate::decoder::TOUCH_X_PERIOD;
+    let center_x = 50.0_f64;
+    let center_y = 230.0_f64;
+    let radius = 30.0_f64;
+    // Map firmware-default normalized coordinates onto the canvas disc.
+    let project_x = |fx: i32| -> f64 {
+        let n = fx as f64 / TOUCH_X_PERIOD as f64;
+        center_x + (n - 0.5) * 2.0 * radius
+    };
+    let project_y = |fy: i32| -> f64 {
+        let n = fy as f64 / 106.0;
+        center_y + (n - 0.5) * 2.0 * radius
+    };
+    let x = project_x(session.x_min);
+    let y = project_y(session.y_min);
+    let width = project_x(session.x_max) - x;
+    let height = project_y(session.y_max) - y;
+    ctx.draw(&Rectangle {
+        x,
+        y,
+        width,
+        height,
+        color: Color::Yellow,
+    });
 }
 
 fn draw_back(ctx: &mut Context<'_>, state: &AppState, now: Instant) {
@@ -571,6 +625,10 @@ fn short_elapsed(d: Duration) -> String {
 }
 
 fn draw_touch_readout(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
+    if let Some(session) = state.calibration_session() {
+        draw_calibration_readout(frame, area, state, session);
+        return;
+    }
     let block = Block::default().borders(Borders::ALL).title("Touch / Buttons");
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -612,6 +670,48 @@ fn draw_touch_readout(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
         }
         None => lines.push(Line::from("touch: idle")),
     }
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+}
+
+fn draw_calibration_readout(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    state: &AppState,
+    session: crate::view::state::CalibrationSession,
+) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(
+            "Calibration",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let saved = state.calibration;
+    let (x_range, y_range, samples) = if session.samples == 0 {
+        ("[--..--]".to_string(), "[--..--]".to_string(), 0usize)
+    } else {
+        (
+            format!("[{}..{}]", session.x_min, session.x_max),
+            format!("[{}..{}]", session.y_min, session.y_max),
+            session.samples,
+        )
+    };
+    let lines = vec![
+        Line::from(Span::styled(
+            "trace a circle on the touchpad",
+            Style::default().fg(Color::Yellow),
+        )),
+        Line::from("press c to finish · Esc to cancel"),
+        Line::from(format!("x: {x_range}  y: {y_range}  samples={samples}")),
+        Line::from(format!(
+            "saved: x=[{}..{}] y=[{}..{}]",
+            saved.x_min, saved.x_max, saved.y_min, saved.y_max,
+        )),
+    ];
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
