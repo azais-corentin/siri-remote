@@ -357,7 +357,7 @@ fn draw_calibration_overlay(ctx: &mut Context<'_>, state: &AppState) {
 fn draw_back(ctx: &mut Context<'_>, state: &AppState, now: Instant) {
     let color = style_for_bit(state, 0x0040, now);
     let cx = 30.0;
-    let cy = 175.0;
+    let cy = 180.0;
     ctx.draw(&Circle {
         x: cx,
         y: cy,
@@ -384,7 +384,7 @@ fn draw_back(ctx: &mut Context<'_>, state: &AppState, now: Instant) {
 fn draw_tv(ctx: &mut Context<'_>, state: &AppState, now: Instant) {
     let color = style_for_bit(state, 0x0001, now);
     let cx = 70.0;
-    let cy = 175.0;
+    let cy = 180.0;
     ctx.draw(&Circle {
         x: cx,
         y: cy,
@@ -403,7 +403,7 @@ fn draw_tv(ctx: &mut Context<'_>, state: &AppState, now: Instant) {
 
 fn draw_play_pause(ctx: &mut Context<'_>, state: &AppState, now: Instant) {
     let color = style_for_bit(state, 0x0100, now);
-    let cx = 50.0;
+    let cx = 30.0;
     let cy = 140.0;
     ctx.draw(&Circle {
         x: cx,
@@ -431,51 +431,64 @@ fn draw_play_pause(ctx: &mut Context<'_>, state: &AppState, now: Instant) {
 fn draw_volume(ctx: &mut Context<'_>, state: &AppState, now: Instant) {
     let up = style_for_bit(state, 0x0002, now);
     let dn = style_for_bit(state, 0x0004, now);
-    // Upper half.
+    // Upper half body (+ bit).
     ctx.draw(&Rectangle {
-        x: 40.0,
-        y: 90.0,
-        width: 20.0,
-        height: 18.0,
+        x: 64.0,
+        y: 110.0,
+        width: 12.0,
+        height: 30.0,
         color: up,
     });
-    // + glyph.
-    ctx.draw(&CanvasLine {
-        x1: 47.0,
-        y1: 99.0,
-        x2: 53.0,
-        y2: 99.0,
-        color: up,
-    });
-    ctx.draw(&CanvasLine {
-        x1: 50.0,
-        y1: 96.0,
-        x2: 50.0,
-        y2: 102.0,
-        color: up,
-    });
-    // Lower half.
+    // Lower half body (− bit).
     ctx.draw(&Rectangle {
-        x: 40.0,
-        y: 72.0,
-        width: 20.0,
-        height: 18.0,
+        x: 64.0,
+        y: 80.0,
+        width: 12.0,
+        height: 30.0,
         color: dn,
     });
-    // − glyph.
+    // Rounded caps: top cap follows + highlight, bottom cap follows −.
+    ctx.draw(&Circle {
+        x: 70.0,
+        y: 140.0,
+        radius: 6.0,
+        color: up,
+    });
+    ctx.draw(&Circle {
+        x: 70.0,
+        y: 80.0,
+        radius: 6.0,
+        color: dn,
+    });
+    // + glyph at (70, 125).
     ctx.draw(&CanvasLine {
-        x1: 47.0,
-        y1: 81.0,
-        x2: 53.0,
-        y2: 81.0,
+        x1: 67.0,
+        y1: 125.0,
+        x2: 73.0,
+        y2: 125.0,
+        color: up,
+    });
+    ctx.draw(&CanvasLine {
+        x1: 70.0,
+        y1: 122.0,
+        x2: 70.0,
+        y2: 128.0,
+        color: up,
+    });
+    // − glyph at (70, 95).
+    ctx.draw(&CanvasLine {
+        x1: 67.0,
+        y1: 95.0,
+        x2: 73.0,
+        y2: 95.0,
         color: dn,
     });
 }
 
 fn draw_mute(ctx: &mut Context<'_>, state: &AppState, now: Instant) {
     let color = style_for_bit(state, 0x0080, now);
-    let cx = 50.0;
-    let cy = 40.0;
+    let cx = 30.0;
+    let cy = 80.0;
     ctx.draw(&Circle {
         x: cx,
         y: cy,

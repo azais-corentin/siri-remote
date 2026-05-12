@@ -71,11 +71,11 @@ pub struct TrailPoint {
     pub stamp: Instant,
 }
 
-/// Per-axis min/max in raw firmware coordinates. `x` uses the cyclic
-/// 11-bit value (`f.x.rem_euclid(TOUCH_X_PERIOD)`); `y` is the firmware
-/// byte (nominally `0..=106`). Default matches the historical hard-coded
-/// behavior, so an uncalibrated state renders identically to the pre-
-/// calibration code.
+/// Per-axis min/max in raw firmware coordinates. `x` is the decoder's
+/// extended monotonic position (continuous across the firmware's cyclic
+/// 11-bit wrap); `y` is the firmware byte (nominally `0..=106`). Default
+/// matches the historical hard-coded behavior, so an uncalibrated state
+/// renders identically to the pre-calibration code.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Calibration {
     pub x_min: i32,
@@ -335,7 +335,7 @@ impl AppState {
                     for (idx, slot) in event.points.iter().enumerate() {
                         if let Some(f) = slot {
                             if let CalibrationMode::Active(ref mut s) = self.calibration_mode {
-                                let raw_x = f.x.rem_euclid(TOUCH_X_PERIOD);
+                                let raw_x = f.x;
                                 s.observe(raw_x, f.y as i32);
                             }
                             if let Some((nx, ny)) = normalize_finger(f, &cal_for_trail) {
@@ -421,7 +421,7 @@ pub fn normalize_finger(f: &FingerData, cal: &Calibration) -> Option<(f64, f64)>
     if x_span == 0 || y_span == 0 {
         return None;
     }
-    let raw_x = f.x.rem_euclid(TOUCH_X_PERIOD);
+    let raw_x = f.x;
     let nx = (raw_x - cal.x_min) as f64 / x_span as f64;
     let ny = (f.y as i32 - cal.y_min) as f64 / y_span as f64;
     Some((nx.clamp(-0.1, 1.1), ny.clamp(-0.1, 1.1)))
@@ -506,6 +506,14 @@ mod tests {
         let (nx, ny) = normalize_finger(&finger(TOUCH_X_PERIOD - 1, 100), &cal).unwrap();
         assert!((nx - 1.1).abs() < 1e-9, "nx={nx}");
         assert!((ny - 1.1).abs() < 1e-9, "ny={ny}");
+    }
+
+    #[test]
+    fn normalize_finger_does_not_wrap_at_period_boundary() {
+        // f.x == TOUCH_X_PERIOD used to fold to the left edge via rem_euclid.
+        let cal = Calibration::default();
+        let (nx, _) = normalize_finger(&finger(TOUCH_X_PERIOD, 53), &cal).unwrap();
+        assert!((nx - 1.0).abs() < 1e-9, "nx={nx}");
     }
 
     #[test]
