@@ -15,7 +15,7 @@ use uuid::Uuid;
 
 use crate::cli::EventsArgs;
 use crate::decoder::{
-    InputDecoder, TouchEvent, format_battery, format_event, format_power, now_stamp, raw_hex,
+    InputDecoder, TouchDecoder, format_battery, format_event, format_power, now_stamp, raw_hex,
 };
 use crate::hid::{
     BATTERY_LEVEL_UUID, BATTERY_POWER_UUID, HID_REPORT_UUID, all_characteristics, find_by_uuid,
@@ -357,8 +357,9 @@ async fn connect_with_pairing(peripheral: &Peripheral, _selection: &Selection) -
 
 async fn stream_connected_client(peripheral: &Peripheral, selection: &Selection) -> Result<()> {
     print_device_info(peripheral, selection).await;
-    let (mut decoder, mut hid_stream) = configure_notifications(peripheral, selection).await?;
-    drain_notifications(peripheral, &mut decoder, &mut hid_stream).await
+    let (mut decoder, mut touch, mut hid_stream) =
+        configure_notifications(peripheral, selection).await?;
+    drain_notifications(peripheral, &mut decoder, &mut touch, &mut hid_stream).await
 }
 
 /// Subscribe to battery / power notifications via btleplug (one
@@ -372,7 +373,7 @@ async fn stream_connected_client(peripheral: &Peripheral, selection: &Selection)
 async fn configure_notifications(
     peripheral: &Peripheral,
     selection: &Selection,
-) -> Result<(InputDecoder, bluez::hid::InputStream)> {
+) -> Result<(InputDecoder, TouchDecoder, bluez::hid::InputStream)> {
     let battery_char = find_by_uuid(peripheral, BATTERY_LEVEL_UUID);
     let power_char = find_by_uuid(peripheral, BATTERY_POWER_UUID);
     let battery_ok = start_optional_notify(peripheral, battery_char.as_ref(), "battery").await;
@@ -417,7 +418,7 @@ async fn configure_notifications(
     hid.write_input_enable(INPUT_ENABLE_BYTE).await?;
     eprintln!("Notifications enabled; waiting for events...");
 
-    Ok((InputDecoder::new(), input_stream))
+    Ok((InputDecoder::new(), TouchDecoder::new(), input_stream))
 }
 
 /// Magic byte the Siri Remote needs on any HID Output report before it
@@ -465,6 +466,7 @@ async fn start_optional_notify(
 async fn drain_notifications(
     peripheral: &Peripheral,
     decoder: &mut InputDecoder,
+    touch: &mut TouchDecoder,
     hid_stream: &mut bluez::hid::InputStream,
 ) -> Result<()> {
     let mut bt_stream = peripheral.notifications().await?;
@@ -503,7 +505,7 @@ async fn drain_notifications(
                 // would be worse than showing the wire bytes.
                 let line = if value.len() == 2 {
                     format_event("input", &identifier, &value, Some(decoder))
-                } else if let Some(touch) = TouchEvent::parse(&value) {
+                } else if let Some(touch) = touch.parse(&value) {
                     format!(
                         "{} input {} raw={} | {}",
                         now_stamp(),
