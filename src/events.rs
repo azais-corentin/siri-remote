@@ -681,6 +681,29 @@ async fn run_forever(
                 selection = new_sel;
             }
             Err(err) => {
+                #[cfg(target_os = "linux")]
+                if let Some(denied) = err.downcast_ref::<bluez::hid::HidInputEnableDenied>() {
+                    eprintln!(
+                        "error: BlueZ refused to enable HID input streaming on {}.\n\
+                         Every writable HID Report on the remote returned org.bluez.Error.NotAuthorized.\n\
+                         \n\
+                         This happens when BlueZ's `hog` plugin (HID-over-GATT) has claimed the\n\
+                         HID service so the kernel can expose it as a uinput device. While the\n\
+                         plugin owns the service no other process is allowed to write to its\n\
+                         Report characteristics, and the Siri Remote needs the 0xAF input-enable\n\
+                         byte written to a Feature report before it will stream events.\n\
+                         \n\
+                         Fix: start bluetoothd without the `hog` (and `input`) plugin. Edit your\n\
+                         bluetooth.service unit so ExecStart reads:\n\
+                         \n\
+                         \x20   ExecStart=/usr/libexec/bluetooth/bluetoothd --noplugin=input,hog\n\
+                         \n\
+                         (the path is /usr/lib/bluetooth/bluetoothd on some distros), then\n\
+                         restart bluetoothd. The existing bond is preserved.",
+                        denied.device_path,
+                    );
+                    return Ok(1);
+                }
                 if !selection.requires_pairing && is_auth_failure(&err) {
                     match switch_to_pairing_scan(adapter).await {
                         Ok(s) => {

@@ -39,6 +39,31 @@ pub const REPORT_TYPE_INPUT: u8 = 1;
 pub const REPORT_TYPE_OUTPUT: u8 = 2;
 pub const REPORT_TYPE_FEATURE: u8 = 3;
 
+/// Error returned by [`HidSession::write_input_enable`] when every writable
+/// non-Input report rejected the input-enable byte with
+/// `org.bluez.Error.NotAuthorized`. This is the signature of BlueZ's `hog`
+/// plugin owning the HID service: while the plugin holds the service, no
+/// userspace client may write its Report characteristics, even on a bonded
+/// link. Distinguishing this case lets the caller surface a targeted
+/// remediation message instead of mistaking it for a bonding failure.
+#[derive(Clone, Debug)]
+pub struct HidInputEnableDenied {
+    pub device_path: String,
+}
+
+impl std::fmt::Display for HidInputEnableDenied {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "BlueZ refused every HID input-enable write on {} \
+             with org.bluez.Error.NotAuthorized",
+            self.device_path,
+        )
+    }
+}
+
+impl std::error::Error for HidInputEnableDenied {}
+
 /// One `Report` characteristic instance under the HID service.
 #[derive(Clone, Debug)]
 pub struct ReportChar {
@@ -222,6 +247,8 @@ impl HidSession {
             );
         }
         let mut ok = 0usize;
+        let mut failures = 0usize;
+        let mut not_authorized = 0usize;
         let mut last_err: Option<anyhow::Error> = None;
         for r in candidates {
             let prefer_cmd = r.prefers_write_without_response();
@@ -243,11 +270,21 @@ impl HidSession {
                         "warning: input-enable write to {} failed: {e:#}",
                         r.path.as_str()
                     );
+                    failures += 1;
+                    let detail = format!("{e:#}");
+                    if detail.contains("NotAuthorized") || detail.contains("Not Authorized") {
+                        not_authorized += 1;
+                    }
                     last_err = Some(e);
                 }
             }
         }
         if ok == 0 {
+            if failures > 0 && not_authorized == failures {
+                return Err(anyhow::Error::new(HidInputEnableDenied {
+                    device_path: self.device_path.clone(),
+                }));
+            }
             return Err(last_err.unwrap_or_else(|| {
                 anyhow::anyhow!("no Report accepted the input-enable byte")
             }));
