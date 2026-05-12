@@ -23,6 +23,8 @@ use zbus::message::Type as MessageType;
 use zbus::{Connection, MatchRule, MessageStream};
 use zvariant::{ObjectPath, OwnedObjectPath, OwnedValue, Value};
 
+use log::{info, warn};
+
 const BLUEZ_BUS: &str = "org.bluez";
 const OM_IFACE: &str = "org.freedesktop.DBus.ObjectManager";
 const PROPS_IFACE: &str = "org.freedesktop.DBus.Properties";
@@ -175,7 +177,7 @@ impl HidSession {
                 }
             }
             let Some(desc_path) = ref_desc else {
-                eprintln!(
+                warn!(
                     "warning: HID report char {char_path} has no Report Reference \
                      descriptor; cannot classify, skipping"
                 );
@@ -185,7 +187,7 @@ impl HidSession {
                 .await
                 .with_context(|| format!("read Report Reference of {char_path}"))?;
             if bytes.len() < 2 {
-                eprintln!(
+                warn!(
                     "warning: Report Reference of {char_path} is {} byte(s); expected 2",
                     bytes.len()
                 );
@@ -257,7 +259,7 @@ impl HidSession {
                 REPORT_TYPE_FEATURE => "feature",
                 _ => "other",
             };
-            eprintln!(
+            info!(
                 "Sending input-enable byte (0x{byte:02X}) to {kind} report \
                  id=0x{:02X} path={}.",
                 r.report_id,
@@ -266,7 +268,7 @@ impl HidSession {
             match write_characteristic(&self.conn, r.path.as_ref(), &[byte], prefer_cmd).await {
                 Ok(()) => ok += 1,
                 Err(e) => {
-                    eprintln!(
+                    warn!(
                         "warning: input-enable write to {} failed: {e:#}",
                         r.path.as_str()
                     );
@@ -345,7 +347,7 @@ impl HidSession {
                     r.path.as_str()
                 )
             })?;
-            eprintln!(
+            info!(
                 "Enabled HID input notifications on report id=0x{:02X} path={}.",
                 r.report_id,
                 r.path.as_str(),

@@ -19,6 +19,8 @@ pub enum Command {
     Pair(PairArgs),
     /// Connect a bonded (or pairing-mode) remote and stream battery/power/HID notifications to stdout.
     Events(EventsArgs),
+    /// Connect a bonded (or pairing-mode) remote and render its live state as a ratatui dashboard.
+    View(ViewArgs),
     /// Remove all paired/bonded Siri Remotes via BlueZ Adapter1.RemoveDevice (Linux only).
     Unpair(UnpairArgs),
 }
@@ -58,4 +60,19 @@ pub struct UnpairArgs {
     /// List matching Siri Remotes but do not remove them.
     #[arg(long, default_value_t = false)]
     pub dry_run: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct ViewArgs {
+    /// Specific bonded Siri Remote identity address (skips initial scan).
+    #[arg(long)]
+    pub address: Option<String>,
+
+    /// Seconds to scan before falling back to address-based connect.
+    #[arg(long, default_value_t = 5.0)]
+    pub scan_seconds: f64,
+
+    /// Delay before reconnect attempts after disconnect/failure.
+    #[arg(long, default_value_t = 0.5)]
+    pub reconnect_delay: f64,
 }

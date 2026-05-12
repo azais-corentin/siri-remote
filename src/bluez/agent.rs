@@ -11,6 +11,7 @@
 use anyhow::Result;
 use zbus::{Connection, connection::Builder, interface};
 use zvariant::ObjectPath;
+use log::{info, warn};
 
 const AGENT_PATH: &str = "/com/example/siri_remote_agent";
 const BLUEZ_BUS: &str = "org.bluez";
@@ -38,7 +39,7 @@ impl AutoConfirmAgent {
 
     fn request_confirmation(&self, device: ObjectPath<'_>, passkey: u32) {
         // Returning Ok confirms the pairing; raising would reject it.
-        eprintln!("  agent: auto-confirming pair request for {device} (passkey={passkey})");
+        info!("  agent: auto-confirming pair request for {device} (passkey={passkey})");
     }
 
     fn request_authorization(&self, _device: ObjectPath<'_>) {}
@@ -85,7 +86,7 @@ impl AgentSession {
         )
         .await?;
 
-        eprintln!("Registered NoInputNoOutput agent (forces Just Works pairing).");
+        info!("Registered NoInputNoOutput agent (forces Just Works pairing).");
         Ok(Self { conn: Some(conn) })
     }
 
@@ -132,6 +133,6 @@ async fn unregister(conn: &Connection) {
         )
         .await
     {
-        eprintln!("  warning: agent unregister failed: {e:?}");
+        warn!("warning: agent unregister failed: {e:?}");
     }
 }

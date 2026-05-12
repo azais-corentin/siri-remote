@@ -14,6 +14,7 @@ use tokio::time::{Instant, timeout};
 use uuid::Uuid;
 
 use crate::decoder::{APPLE_COMPANY_ID, APPLE_HID_MFR_PREFIX};
+use log::info;
 
 /// HID Service UUID (GATT short form `0x1812`, expanded to the BT base UUID).
 pub const HID_SERVICE_UUID: Uuid = Uuid::from_u128(0x0000_1812_0000_1000_8000_0080_5f9b_34fb);
@@ -168,7 +169,7 @@ impl CandidateMap {
             .last_name
             .clone()
             .unwrap_or_else(|| entry.identity.clone());
-        eprintln!(
+        info!(
             "  identity={} addr={} name={:?} rssi={} hits={} mean_rssi={:.1}",
             entry.identity,
             entry.last_address,
@@ -207,12 +208,12 @@ impl CandidateMap {
             mean_rssi: best.mean(),
             last_name: best.last_name.clone(),
         };
-        eprintln!(
+        info!(
             "\nLocked on identity {} via current address {} (mean RSSI {:.1} over {} adverts, last rssi {})",
             cand.identity_address, cand.last_address, cand.mean_rssi, cand.hits, cand.last_rssi,
         );
         if fresh.len() > 1 {
-            eprintln!(
+            info!(
                 "  ({} other Siri Remote(s) also in range; picked the one with the strongest signal)",
                 fresh.len() - 1,
             );
@@ -251,7 +252,7 @@ pub async fn scan_for_remote(
         .await
         .map_err(|e| ScanError::Other(anyhow::anyhow!(e.to_string())))?;
 
-    eprintln!(
+    info!(
         "Scanning for {:.0}s for a Siri Remote in pairing mode...",
         settle.as_secs_f64()
     );
@@ -286,7 +287,7 @@ pub async fn scan_for_remote(
             }
             Err(_) => {
                 if Instant::now() >= settle_deadline && !settle_announced {
-                    eprintln!("  no fresh qualifying candidate yet; scanning 2s more...");
+                    info!("  no fresh qualifying candidate yet; scanning 2s more...");
                     settle_announced = true;
                 }
             }
@@ -305,7 +306,7 @@ pub async fn scan_for_nearest_remote(adapter: &Adapter, settle: Duration) -> Opt
     adapter.start_scan(ScanFilter::default()).await.ok()?;
     let mut events = adapter.events().await.ok()?;
 
-    eprintln!(
+    info!(
         "Scanning {:.0}s for Siri Remote advertisements...",
         settle.as_secs_f64()
     );

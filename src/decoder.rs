@@ -134,6 +134,7 @@ impl InputDecoder {
         Self { last_button: 0 }
     }
 
+    #[allow(dead_code)]
     /// Read both bytes of a button report as a little-endian 16-bit mask.
     /// Returns `None` for any payload that is not exactly 2 bytes.
     fn mask(data: &[u8]) -> Option<u16> {
@@ -142,6 +143,21 @@ impl InputDecoder {
         }
         Some(u16::from_le_bytes([data[0], data[1]]))
     }
+
+    /// Update the tracked button mask, returning the previous value. Used
+    /// by [`crate::session::Session`] to compute press/release deltas
+    /// without going through the human-readable [`InputDecoder::format`]
+    /// path. Note: matches `format`'s legacy quirk that a state-refresh
+    /// packet (identical mask) does NOT advance `last_button` — there is
+    /// nothing to advance.
+    pub fn advance(&mut self, mask: u16) -> u16 {
+        let prev = self.last_button;
+        if mask != prev {
+            self.last_button = mask;
+        }
+        prev
+    }
+    #[allow(dead_code)]
 
     /// Render a 2-byte HID button payload as a `buttons=…; pressed=…;
     /// released=…` line. Returns the `unknown HID packet len=N` fallback
@@ -460,6 +476,7 @@ impl TouchDecoder {
 /// `identifier` is rendered as-is into the line; callers supply something
 /// like `"uuid=0000xxxx-…"`. (Python used `handle=0xHHHH`; btleplug does not
 /// expose attribute handles, so the plan substitutes the UUID for the same
+#[allow(dead_code)]
 /// diagnostic role.)
 pub fn format_event(
     source: &str,

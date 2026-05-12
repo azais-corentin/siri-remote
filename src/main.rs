@@ -1,13 +1,16 @@
 //! `siri-remote` binary entry point: parses the CLI, dispatches to the
 //! matching subcommand module, and treats Ctrl-C as exit code 130.
 
+mod logger;
 mod cli;
 mod decoder;
 mod events;
 mod hid;
 mod pair;
 mod scan;
+mod session;
 mod unpair;
+mod view;
 
 #[cfg(target_os = "linux")]
 mod bluez;
@@ -18,6 +21,7 @@ use cli::{Cli, Command};
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> std::process::ExitCode {
+    logger::init();
     let cli = Cli::parse();
 
     let work = async move {
@@ -25,6 +29,7 @@ async fn main() -> std::process::ExitCode {
             Command::Pair(args) => pair::run(args).await,
             Command::Events(args) => events::run(args).await,
             Command::Unpair(args) => unpair::run(args).await,
+            Command::View(args) => view::run(args).await,
         }
     };
 
