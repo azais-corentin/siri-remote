@@ -1,6 +1,10 @@
 //! Command-line surface for the `siri-remote` binary.
 
+use std::path::PathBuf;
+
 use clap::{Args, Parser, Subcommand};
+
+use crate::gamepad::config::StickMode;
 
 #[derive(Parser)]
 #[command(
@@ -31,6 +35,11 @@ pub enum Command {
     /// audio stream emitted on HID input report 0xFA while the Siri button is
     /// held, and expose it as a PipeWire virtual microphone (Audio/Source).
     Mic(MicArgs),
+    /// Connect a bonded (or pairing-mode) remote and expose it as a virtual
+    /// Xbox 360 gamepad through uinput: touchpad -> left stick, clickpad
+    /// clicks -> D-pad, remote buttons -> face / shoulder / start buttons.
+    /// Requires write access to /dev/uinput.
+    Gamepad(GamepadArgs),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -131,4 +140,43 @@ pub struct MicArgs {
     /// Human-readable PipeWire node description (shown in mixers / pavucontrol).
     #[arg(long, default_value = "Siri Remote microphone")]
     pub node_description: String,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct GamepadArgs {
+    /// Specific bonded Siri Remote identity address (skips initial scan).
+    #[arg(long)]
+    pub address: Option<String>,
+
+    /// Seconds to scan before falling back to address-based connect.
+    #[arg(long, default_value_t = 5.0)]
+    pub scan_seconds: f64,
+
+    /// Delay before reconnect attempts after disconnect/failure.
+    #[arg(long, default_value_t = 0.5)]
+    pub reconnect_delay: f64,
+
+    /// Touchpad-to-left-stick mapping. `relative`: the touch-down point
+    /// becomes the stick centre. `absolute`: the calibrated pad position maps
+    /// straight onto the stick. Overrides `stick_mode` in gamepad.toml.
+    /// [default: relative]
+    #[arg(long, value_enum)]
+    pub stick_mode: Option<StickMode>,
+
+    /// Fraction of the touchpad span that equals full stick deflection in
+    /// `relative` mode; must be in (0.0, 2.0]. Overrides `stick_radius` in
+    /// gamepad.toml. [default: 0.35]
+    #[arg(long)]
+    pub stick_radius: Option<f64>,
+
+    /// Radial dead zone as a fraction of full deflection; must be in
+    /// [0.0, 0.9). Overrides `deadzone` in gamepad.toml. [default: 0.05]
+    #[arg(long)]
+    pub deadzone: Option<f64>,
+
+    /// Explicit mapping file. Default:
+    /// $XDG_CONFIG_HOME/siri-remote/gamepad.toml (optional; built-in mapping
+    /// is used when absent).
+    #[arg(long)]
+    pub config: Option<PathBuf>,
 }

@@ -9,6 +9,7 @@ mod dump;
 mod mic;
 mod audio;
 mod calibration;
+mod gamepad;
 mod hid;
 mod pair;
 mod scan;
@@ -36,6 +37,7 @@ async fn main() -> std::process::ExitCode {
             Command::View(args) => view::run(args).await,
             Command::Dump(args) => dump::run(args).await,
             Command::Mic(args) => mic::run(args).await,
+            Command::Gamepad(args) => gamepad::run(args).await,
         }
     };
 
