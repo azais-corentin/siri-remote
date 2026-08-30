@@ -1,5 +1,4 @@
-//! Persistence for touchpad [`Calibration`]. IO-only — the data type
-//! and the live calibration state machine live in [`super::state`].
+//! Touchpad calibration bounds and their on-disk persistence.
 //!
 //! Resolution order for the config file:
 //!   1. `$XDG_CONFIG_HOME/siri-remote/calibration.toml`, if set,
@@ -13,8 +12,40 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 
-use super::state::Calibration;
+/// Touchpad-to-canvas mapping.
+///
+/// Both axes are linear: `x_min..=x_max` maps to canvas X `0..=1`, and
+/// `y_min..=y_max` maps to canvas Y `0..=1`. The firmware encodes (x, y)
+/// as 12-bit signed integers, so each bound naturally sits in
+/// `-2048..=2047`.
+///
+/// Defaults are derived from the four `*_at_center_*.txt` swipe captures
+/// in the repository; per-device variance is small enough that the
+/// out-of-the-box mapping is usable without calibration, but a saved
+/// calibration tightens both axes to the user's pad.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Calibration {
+    pub x_min: i32,
+    pub x_max: i32,
+    pub y_min: i32,
+    pub y_max: i32,
+}
+
+impl Default for Calibration {
+    fn default() -> Self {
+        // Empirical extents across the gen-3 capture corpus
+        // (`*_at_center_*.txt`): signed X observed in -2029..=+1984,
+        // signed Y in -1010..=+270.
+        Self {
+            x_min: -2029,
+            x_max: 1984,
+            y_min: -1010,
+            y_max: 270,
+        }
+    }
+}
 
 const CONFIG_DIR: &str = "siri-remote";
 const CONFIG_FILE: &str = "calibration.toml";
@@ -36,9 +67,15 @@ pub fn config_base() -> Option<PathBuf> {
     })
 }
 
+/// Path to `<base>/siri-remote/<file>`. Every config file this crate owns
+/// lives in the same directory; [`config_path_in`] is the calibration case.
+pub fn config_file_in(base: &Path, file: &str) -> PathBuf {
+    base.join(CONFIG_DIR).join(file)
+}
+
 /// Full file path for the calibration TOML, given a resolved config base.
 pub fn config_path_in(base: &Path) -> PathBuf {
-    base.join(CONFIG_DIR).join(CONFIG_FILE)
+    config_file_in(base, CONFIG_FILE)
 }
 
 /// Load calibration from the given base. Returns `Ok(None)` when the
@@ -52,8 +89,8 @@ pub fn load_in(base: &Path) -> Result<Option<Calibration>> {
             return Err(err).with_context(|| format!("reading {}", path.display()));
         }
     };
-    let c: Calibration = toml::from_str(&text)
-        .with_context(|| format!("parsing {}", path.display()))?;
+    let c: Calibration =
+        toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
     Ok(Some(c))
 }
 
@@ -82,8 +119,7 @@ pub fn load() -> Option<Calibration> {
 pub fn save_in(base: &Path, c: &Calibration) -> Result<()> {
     let path = config_path_in(base);
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
+        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     }
     let body = toml::to_string(c).context("serializing calibration")?;
     fs::write(&path, body).with_context(|| format!("writing {}", path.display()))?;
@@ -141,9 +177,16 @@ mod tests {
     #[test]
     fn save_then_load_roundtrip() {
         let base = temp_base();
-        let c = Calibration { x_min: -1800, x_max: 1800, y_min: -500, y_max: 200 };
+        let c = Calibration {
+            x_min: -1800,
+            x_max: 1800,
+            y_min: -500,
+            y_max: 200,
+        };
         save_in(&base, &c).unwrap();
-        let loaded = load_in(&base).unwrap().expect("calibration present after save");
+        let loaded = load_in(&base)
+            .unwrap()
+            .expect("calibration present after save");
         assert_eq!(loaded, c);
         // Cleanup.
         let _ = fs::remove_dir_all(&base);

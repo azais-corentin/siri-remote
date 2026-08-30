@@ -5,9 +5,9 @@ use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::time::Duration;
 
-use serde::{Deserialize, Serialize};
 use tokio::time::Instant;
 
+use crate::calibration::Calibration;
 use crate::decoder::{FingerData, TouchEvent};
 use crate::logger::LogRecord;
 use crate::session::{DeviceEvent, PowerState, Selection};
@@ -70,39 +70,6 @@ pub struct TrailPoint {
     /// Time the sample was captured. Used to bucket the trail into fade
     /// levels (newer = brighter).
     pub stamp: Instant,
-}
-
-/// Touchpad-to-canvas mapping.
-///
-/// Both axes are linear: `x_min..=x_max` maps to canvas X `0..=1`, and
-/// `y_min..=y_max` maps to canvas Y `0..=1`. The firmware encodes (x, y)
-/// as 12-bit signed integers, so each bound naturally sits in
-/// `-2048..=2047`.
-///
-/// Defaults are derived from the four `*_at_center_*.txt` swipe captures
-/// in the repository; per-device variance is small enough that the
-/// out-of-the-box mapping is usable without calibration, but a saved
-/// calibration tightens both axes to the user's pad.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Calibration {
-    pub x_min: i32,
-    pub x_max: i32,
-    pub y_min: i32,
-    pub y_max: i32,
-}
-
-impl Default for Calibration {
-    fn default() -> Self {
-        // Empirical extents across the gen-3 capture corpus
-        // (`*_at_center_*.txt`): signed X observed in -2029..=+1984,
-        // signed Y in -1010..=+270.
-        Self {
-            x_min: -2029,
-            x_max: 1984,
-            y_min: -1010,
-            y_max: 270,
-        }
-    }
 }
 
 /// Running bounds for an in-progress calibration session.

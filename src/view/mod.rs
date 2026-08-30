@@ -19,7 +19,6 @@ use crate::logger::{self, LogRecord};
 use crate::session::{self, InitError, Selection, Session};
 
 pub mod app;
-pub mod calibration;
 pub mod state;
 pub mod ui;
 
@@ -66,7 +65,7 @@ pub async fn run(args: ViewArgs) -> Result<u8> {
     let (log_tx, mut log_rx) = mpsc::unbounded_channel::<LogRecord>();
     let mut guard = TerminalGuard::enter()?;
     logger::set_sink(log_tx);
-    let initial_calibration = calibration::load().unwrap_or_default();
+    let initial_calibration = crate::calibration::load().unwrap_or_default();
     run_forever(
         &adapter,
         selection,
@@ -84,7 +83,7 @@ async fn run_forever(
     reconnect_delay: Duration,
     terminal: &mut DefaultTerminal,
     log_rx: &mut UnboundedReceiver<LogRecord>,
-    initial_calibration: state::Calibration,
+    initial_calibration: crate::calibration::Calibration,
 ) -> Result<u8> {
     let mut state = AppState::new(selection.clone(), initial_calibration);
     let mut events = EventStream::new();

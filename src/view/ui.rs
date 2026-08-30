@@ -421,8 +421,9 @@ fn draw_contact_ellipses(ctx: &mut Context<'_>, state: &AppState) {
 /// overlay aligns with the trail (which is also rendered via the
 /// default mapping during calibration).
 fn draw_calibration_overlay(ctx: &mut Context<'_>, state: &AppState) {
+    use crate::calibration::Calibration;
     use crate::decoder::FingerData;
-    use crate::view::state::{Calibration, normalize_finger};
+    use crate::view::state::normalize_finger;
 
     let Some(session) = state.calibration_session() else {
         return;

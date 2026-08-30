@@ -11,9 +11,9 @@ use ratatui::DefaultTerminal;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::time::{Instant, MissedTickBehavior, interval};
 
+use crate::calibration;
 use crate::logger::LogRecord;
 use crate::session::{DeviceEvent, Session};
-use crate::view::calibration;
 use crate::view::state::{AppState, FinishOutcome};
 use crate::view::ui;
 

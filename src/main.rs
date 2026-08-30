@@ -8,6 +8,7 @@ mod events;
 mod dump;
 mod mic;
 mod audio;
+mod calibration;
 mod hid;
 mod pair;
 mod scan;
